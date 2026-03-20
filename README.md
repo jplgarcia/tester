@@ -82,9 +82,12 @@ export CARTESI_APP_ADDRESS=0x<from cartesi run output>
 export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb476c6b8d6127953925584fc4128
 ```
 
-Then deploy:
+**Wait 10+ seconds** for Cartesi to fully initialize Anvil account balances, then deploy:
 
 ```bash
+# Give Anvil time to initialize (usually ~10 seconds)
+sleep 10
+
 cd contracts
 forge script script/Deploy.s.sol \
   --rpc-url http://localhost:6751/anvil \
@@ -299,20 +302,30 @@ forge script script/Deploy.s.sol --rpc-url http://localhost:6751/anvil --broadca
 error code -32003: Insufficient funds for gas * price + value
 ```
 
-**Solution:** This can happen if:
-1. Cartesi was restarted and the account balance was reset
-2. Cartesi RPC endpoint is temporarily unavailable
+**Cause:** Cartesi's Anvil takes ~10 seconds to initialize account balances. If you run `forge script Deploy` immediately after starting `cartesi run`, the account will have no funds yet.
 
-Try restarting Cartesi:
+**Solution:** Wait before deploying:
+
 ```bash
-# Kill existing Cartesi
-pkill -f "cartesi run"
+# After running "cartesi run", wait at least 10 seconds
+sleep 10
 
-# Restart with short epoch for testing
-cartesi run --epoch-length 5
+# Then deploy
+export CARTESI_APP_ADDRESS=0x...
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb476c6b8d6127953925584fc4128
+cd contracts
+forge script script/Deploy.s.sol --rpc-url http://localhost:6751/anvil --broadcast
 ```
 
-Then retry the deployment.
+**Alternative:** Verify the account is funded before deploying:
+
+```bash
+# Check if account has funds (should be > 0x0)
+curl -s http://localhost:6751/anvil -X POST -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x260c013192813f80c7ded483454383d45cdbd3b0","latest"],"id":1}'
+
+# If result is "0x0", wait a few more seconds and try again
+```
 
 | Output | Max payload |
 |---|---|
