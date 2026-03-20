@@ -72,21 +72,33 @@ Cartesi application: 0x75135d8ADb7180640D7f915066F5C710B7D9b8F0
 
 ### 2 — Deploy test token contracts
 
+First, get the app address from `cartesi run` output and set environment variables:
+
+```bash
+# Set the app address (printed by cartesi run)
+export CARTESI_APP_ADDRESS=0x<from cartesi run output>
+
+# Set the Anvil test account private key
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb476c6b8d6127953925584fc4128
+```
+
+Then deploy:
+
 ```bash
 cd contracts
 forge script script/Deploy.s.sol \
-  --rpc-url http://localhost:8545 \
-  --broadcast -vv
+  --rpc-url http://localhost:6751/anvil \
+  --broadcast
 ```
 
-Note the addresses printed at the end and export them:
+Note the contract addresses printed at the end:
 
-```bash
-export CARTESI_APP_ADDRESS=0x<from cartesi run output>
-export TEST_ERC20_ADDRESS=0x...
-export TEST_ERC721_ADDRESS=0x...
-export TEST_ERC1155_ADDRESS=0x...
-export MINTABLE_ERC721_ADDRESS=0x...
+```
+=== Deployed ===
+TestERC20:      0x...
+TestERC721:     0x...
+TestERC1155:    0x...
+MintableERC721: 0x...
 ```
 
 ### 3 — Configure the test suite
@@ -94,22 +106,21 @@ export MINTABLE_ERC721_ADDRESS=0x...
 ```bash
 cd tests
 cp .env.example .env
-# fill in the five addresses exported above
 ```
 
-Key variables in `.env`:
+Update `.env` with the addresses from above. The key variables are:
 
-| Variable | Description |
-|---|---|
-| `CARTESI_APP_ADDRESS` | App contract from `cartesi run` |
-| `TEST_ERC20_ADDRESS` | Deployed by `forge script Deploy` |
-| `TEST_ERC721_ADDRESS` | Deployed by `forge script Deploy` |
-| `TEST_ERC1155_ADDRESS` | Deployed by `forge script Deploy` |
-| `MINTABLE_ERC721_ADDRESS` | Deployed by `forge script Deploy` |
-| `RPC_URL` | Anvil RPC (default `http://127.0.0.1:6751/anvil`) |
-| `NODE_RPC_URL` | Cartesi node JSON-RPC (default `http://127.0.0.1:6751/rpc`) |
-| `INSPECT_URL` | Cartesi inspect REST (default `http://127.0.0.1:6751/inspect/tester`) |
-| `EPOCH_LENGTH` | Must match `--epoch-length` flag (default `5`) — used by suite 08 only |
+| Variable | Description | Source |
+|---|---|---|
+| `CARTESI_APP_ADDRESS` | App contract from `cartesi run` output | From `cartesi run` |
+| `ERC20_ADDRESS` | TestERC20 contract | From `forge script Deploy` |
+| `ERC721_ADDRESS` | TestERC721 contract | From `forge script Deploy` |
+| `ERC1155_ADDRESS` | TestERC1155 contract | From `forge script Deploy` |
+| `MINTABLE_ERC721_ADDRESS` | MintableERC721 contract | From `forge script Deploy` |
+| `RPC_URL` | Anvil RPC | Default: `http://127.0.0.1:6751/anvil` |
+| `NODE_RPC_URL` | Cartesi node JSON-RPC | Default: `http://127.0.0.1:6751/rpc` |
+| `INSPECT_URL` | Cartesi inspect REST | Default: `http://127.0.0.1:6751/inspect/tester` |
+| `EPOCH_LENGTH` | Must match `--epoch-length` flag | Default: `5` |
 
 ### 4 — Install dependencies and run
 
@@ -263,7 +274,45 @@ The test suite verifies:
 
 ---
 
-## Output size limits
+## Troubleshooting
+
+### `forge script` fails with "environment variable not found"
+
+**Error:**
+```
+vm.envAddress: environment variable "CARTESI_APP_ADDRESS" not found
+vm.envUint: environment variable "PRIVATE_KEY" not found
+```
+
+**Solution:** Set both environment variables before running forge script:
+
+```bash
+export CARTESI_APP_ADDRESS=0x<address from cartesi run>
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb476c6b8d6127953925584fc4128
+forge script script/Deploy.s.sol --rpc-url http://localhost:6751/anvil --broadcast
+```
+
+### `forge script` fails with "Insufficient funds for gas"
+
+**Error:**
+```
+error code -32003: Insufficient funds for gas * price + value
+```
+
+**Solution:** This can happen if:
+1. Cartesi was restarted and the account balance was reset
+2. Cartesi RPC endpoint is temporarily unavailable
+
+Try restarting Cartesi:
+```bash
+# Kill existing Cartesi
+pkill -f "cartesi run"
+
+# Restart with short epoch for testing
+cartesi run --epoch-length 5
+```
+
+Then retry the deployment.
 
 | Output | Max payload |
 |---|---|
