@@ -1,0 +1,29 @@
+{
+  "name": "cartesi-dapp-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Integration tests for the Cartesi test dapp",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --runInBand --forceExit",
+    "test:verbose": "node --experimental-vm-modules node_modules/.bin/jest --runInBand --forceExit --verbose"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 120000,
+    "testMatch": ["**/tests/**/*.test.js"],
+    "testSequencer": "./testSequencer.js",
+    "resetModules": false,
+    "verbose": true,
+    "extensionsToTreatAsEsm": [".ts"],
+    "transform": {}
+  },
+  "dependencies": {
+    "@cartesi/viem": "2.0.0-alpha.29",
+    "dotenv": "^16.4.7",
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
