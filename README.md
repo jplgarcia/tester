@@ -37,6 +37,8 @@ address:     0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 ```
 
+**This is the account with funds.** Use this private key for `forge script Deploy`.
+
 ---
 
 ## Running
@@ -78,8 +80,8 @@ First, get the app address from `cartesi run` output and set environment variabl
 # Set the app address (printed by cartesi run)
 export CARTESI_APP_ADDRESS=0x<from cartesi run output>
 
-# Set the Anvil test account private key
-export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb476c6b8d6127953925584fc4128
+# Set the Anvil test account private key (the default Anvil account)
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 ```
 
 **Wait 10+ seconds** for Cartesi to fully initialize Anvil account balances, then deploy:
@@ -291,7 +293,7 @@ vm.envUint: environment variable "PRIVATE_KEY" not found
 
 ```bash
 export CARTESI_APP_ADDRESS=0x<address from cartesi run>
-export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb476c6b8d6127953925584fc4128
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 forge script script/Deploy.s.sol --rpc-url http://localhost:6751/anvil --broadcast
 ```
 
@@ -312,7 +314,7 @@ sleep 10
 
 # Then deploy
 export CARTESI_APP_ADDRESS=0x...
-export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb476c6b8d6127953925584fc4128
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 cd contracts
 forge script script/Deploy.s.sol --rpc-url http://localhost:6751/anvil --broadcast
 ```
