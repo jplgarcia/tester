@@ -9,7 +9,7 @@
  *   1. Deposit fresh assets for each withdrawal type
  *   2. Send withdrawal + notice commands — capture output indices
  *   3. Mine EPOCH_LENGTH+1 blocks to close the epoch
- *   4. Wait for Merkle proofs (outputHashesSiblings populated)
+ *   4. Wait until the node's epoch is CLAIM_ACCEPTED, then fetch outputs (proofs attached)
  *   5. Execute vouchers → assert L1 balances changed
  *   6. Validate notices → assert true
  */
@@ -20,7 +20,7 @@ import {
   ADDR, deployer,
   publicClient, publicClientL2,
   sendAdvance, pollInput,
-  mineBlocks, waitForOutputProof,
+  mineBlocks, waitForEpochClaimAccepted, getOutputWithProof,
   executeVoucher, validateNotice,
   depositEth, depositERC20, depositERC721,
   depositERC1155Single, depositERC1155Batch,
@@ -100,7 +100,7 @@ beforeAll(async () => {
   // ── 3. Mine blocks to close the epoch ──────────────────────────────────────
   await mineBlocks(EPOCH_LENGTH + 2);
 
-  // ── 4. Wait for Merkle proofs ───────────────────────────────────────────────
+  // ── 4. Hard gate: epoch CLAIM_ACCEPTED, then fetch outputs with proofs ─────
   const noticeRaw   = noticeInput.notices[0];
   const ethRaw      = ethInput.vouchers[0];
   const erc20Raw    = erc20Input.vouchers[0];
@@ -108,6 +108,18 @@ beforeAll(async () => {
   const erc1155SRaw = erc1155SInput.vouchers[0];
   const erc1155BRaw = erc1155BInput.vouchers[0];
   const mintRaw     = mintInput.vouchers[0];
+
+  const maxEpoch = [
+    noticeInput.epochIndex,
+    ethInput.epochIndex,
+    erc20Input.epochIndex,
+    erc721Input.epochIndex,
+    erc1155SInput.epochIndex,
+    erc1155BInput.epochIndex,
+    mintInput.epochIndex,
+  ].reduce((a, b) => (a > b ? a : b));
+
+  await waitForEpochClaimAccepted(maxEpoch);
 
   [
     ctx.noticeOutput,
@@ -118,13 +130,13 @@ beforeAll(async () => {
     ctx.erc1155BOutput,
     ctx.mintOutput,
   ] = await Promise.all([
-    waitForOutputProof(noticeRaw.index),
-    waitForOutputProof(ethRaw.index),
-    waitForOutputProof(erc20Raw.index),
-    waitForOutputProof(erc721Raw.index),
-    waitForOutputProof(erc1155SRaw.index),
-    waitForOutputProof(erc1155BRaw.index),
-    waitForOutputProof(mintRaw.index),
+    getOutputWithProof(noticeRaw.index),
+    getOutputWithProof(ethRaw.index),
+    getOutputWithProof(erc20Raw.index),
+    getOutputWithProof(erc721Raw.index),
+    getOutputWithProof(erc1155SRaw.index),
+    getOutputWithProof(erc1155BRaw.index),
+    getOutputWithProof(mintRaw.index),
   ]);
 
   // ── 5. Snapshot L1 balances before execution ────────────────────────────────
@@ -231,22 +243,24 @@ describe('Overdraft voucher execution (L1 execution should revert)', () => {
     if (erc20OdInput.status !== 'ACCEPTED') throw new Error('erc20 overdraft not ACCEPTED');
     if (erc721OdInput.status !== 'ACCEPTED') throw new Error('erc721 overdraft not ACCEPTED');
 
-    // Mine blocks to close another epoch
     await mineBlocks(EPOCH_LENGTH + 2);
 
-    // Wait for Merkle proofs
     const ethOdRaw   = ethOdInput.vouchers[0];
     const erc20OdRaw = erc20OdInput.vouchers[0];
     const erc721OdRaw = erc721OdInput.vouchers[0];
+
+    const maxOdEpoch = [ethOdInput.epochIndex, erc20OdInput.epochIndex, erc721OdInput.epochIndex]
+      .reduce((a, b) => (a > b ? a : b));
+    await waitForEpochClaimAccepted(maxOdEpoch);
 
     [
       ctxOverdraft.ethOverdraftOutput,
       ctxOverdraft.erc20OverdraftOutput,
       ctxOverdraft.erc721OverdraftOutput,
     ] = await Promise.all([
-      waitForOutputProof(ethOdRaw.index),
-      waitForOutputProof(erc20OdRaw.index),
-      waitForOutputProof(erc721OdRaw.index),
+      getOutputWithProof(ethOdRaw.index),
+      getOutputWithProof(erc20OdRaw.index),
+      getOutputWithProof(erc721OdRaw.index),
     ]);
   }, 600_000);
 
