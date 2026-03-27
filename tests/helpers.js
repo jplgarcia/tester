@@ -143,9 +143,10 @@ async function pollInput(index, timeoutMs = 90_000) {
   );
 
   return {
-    status:   inputResult.status,
+    status:     inputResult.status,
+    epochIndex: inputResult.epochIndex,
     notices,
-    reports:  reportsResult.data || [],
+    reports:    reportsResult.data || [],
     vouchers,
   };
 }
@@ -333,33 +334,69 @@ async function mineBlocks(n) {
 }
 
 // =============================================================================
-// VOUCHER EXECUTION
+// EPOCH CLAIM + OUTPUT PROOFS (L1 validateOutput / executeOutput)
 // =============================================================================
 
 /**
- * Poll publicClientL2.getOutput() until outputHashesSiblings is populated
- * (meaning the epoch has been finalized and the proof is ready).
- * @param {bigint} outputIndex  — the global output index in the application
+ * Poll until the node's epoch reaches CLAIM_ACCEPTED (hard acceptance for claims).
+ * Mines a few L1 blocks periodically so the node can advance even with long
+ * epoch lengths or slow polling.
+ * @param {bigint} epochIndex
  * @param {number} timeoutMs
  */
-async function waitForOutputProof(outputIndex, timeoutMs = 300_000) {
+async function waitForEpochClaimAccepted(epochIndex, timeoutMs = 600_000) {
   const app      = ADDR.APP();
   const deadline = Date.now() + timeoutMs;
-  const bigIdx   = BigInt(outputIndex);
-  let ticks = 0;
+  const ei       = BigInt(epochIndex);
+  let ticks      = 0;
   while (Date.now() < deadline) {
-    const output = await publicClientL2.getOutput({ application: app, outputIndex: bigIdx });
-    if (output && output.outputHashesSiblings !== null) return output;
-    // Mine 2 fresh blocks every ~10s so the node keeps seeing new blocks and is
-    // guaranteed to cross the epoch boundary even if the initial mineBlocks()
-    // call was not picked up immediately by the node's polling loop.
-    if (++ticks % 5 === 0) {
-      await mineBlocks(2).catch(() => {});
+    try {
+      const epoch = await publicClientL2.getEpoch({ application: app, epochIndex: ei });
+      if (epoch?.status === 'CLAIM_ACCEPTED') return epoch;
+    } catch {
+      // Epoch row may not exist yet on the node; keep mining and polling.
     }
+    if (++ticks % 5 === 0) await mineBlocks(2).catch(() => {});
     await sleep(2000);
   }
-  throw new Error(`Output ${outputIndex} proof not available after ${timeoutMs}ms`);
+  throw new Error(`Epoch ${ei} not CLAIM_ACCEPTED after ${timeoutMs}ms`);
 }
+
+/**
+ * Fetch a single output after CLAIM_ACCEPTED; proofs should already be attached.
+ * One retry with extra mining covers occasional node lag.
+ * @param {bigint|number|string} outputIndex — global output index
+ * @param {number} timeoutMs
+ */
+async function getOutputWithProof(outputIndex, timeoutMs = 60_000) {
+  const app      = ADDR.APP();
+  const bigIdx   = BigInt(outputIndex);
+  const deadline = Date.now() + timeoutMs;
+
+  async function once() {
+    return publicClientL2.getOutput({ application: app, outputIndex: bigIdx });
+  }
+
+  let output = await once();
+  if (output?.outputHashesSiblings !== null) return output;
+
+  await mineBlocks(2).catch(() => {});
+  await sleep(500);
+  output = await once();
+  if (output?.outputHashesSiblings !== null) return output;
+
+  while (Date.now() < deadline) {
+    await mineBlocks(2).catch(() => {});
+    await sleep(1000);
+    output = await once();
+    if (output?.outputHashesSiblings !== null) return output;
+  }
+  throw new Error(`Output ${outputIndex} missing Merkle siblings after CLAIM_ACCEPTED (${timeoutMs}ms)`);
+}
+
+// =============================================================================
+// VOUCHER EXECUTION
+// =============================================================================
 
 /**
  * Execute a voucher on L1 (calls the application's executeOutput).
@@ -397,7 +434,8 @@ export {
   sendRawInput,
   pollInput,
   mineBlocks,
-  waitForOutputProof,
+  waitForEpochClaimAccepted,
+  getOutputWithProof,
   executeVoucher,
   validateNotice,
   noticeCount, reportCount, voucherCount,
