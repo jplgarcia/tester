@@ -7,7 +7,9 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createCartesiPublicClient, walletActionsL1, publicActionsL1, getInputsAdded } from '@cartesi/viem';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: join(__dirname, '.env') });
+// Shell-exported vars would otherwise win over tests/.env (dotenv default), which
+// breaks runs after changing CARTESI_APP_ADDRESS in the file but not the terminal.
+dotenv.config({ path: join(__dirname, '.env'), override: true });
 
 // =============================================================================
 // ENV
@@ -21,6 +23,16 @@ const e = (key) => {
 const RPC_URL      = process.env.RPC_URL      || 'http://127.0.0.1:6751/anvil';
 const NODE_RPC_URL = process.env.NODE_RPC_URL || 'http://127.0.0.1:6751/rpc';
 const INSPECT_URL  = process.env.INSPECT_URL  || 'http://127.0.0.1:6751/inspect/tester';
+
+/** Origin (scheme + host + port) for inspect — may differ from JSON-RPC port (see INSPECT_URL). */
+function inspectOriginFromEnv() {
+  try {
+    const u = new URL(INSPECT_URL);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return 'http://127.0.0.1:6751';
+  }
+}
 const PRIVATE_KEY  = process.env.PRIVATE_KEY  || '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 /** Second Anvil account — for negative tests (e.g. targeted voucher must revert). */
 const OTHER_PRIVATE_KEY = process.env.OTHER_PRIVATE_KEY
@@ -217,11 +229,10 @@ const voucherDest = (input, n = 0) =>
  */
 async function sendInspect(json) {
   // Cartesi v2: POST /inspect/{app_address}  body: {"payload":"0x{hex}"}
-  // Use the app address directly — INSPECT_URL may contain an app name which
-  // must NOT be combined with the address (node accepts one or the other).
+  // Inspect is often on a different port than JSON-RPC — derive origin from INSPECT_URL
+  // (e.g. http://127.0.0.1:10012/inspect/tester → http://127.0.0.1:10012).
   const hexPayload = '0x' + Buffer.from(JSON.stringify(json)).toString('hex');
-  const nodeBase = NODE_RPC_URL.replace(/\/rpc\/?$/, '');
-  const url = `${nodeBase}/inspect/${ADDR.APP()}`;
+  const url = `${inspectOriginFromEnv()}/inspect/${ADDR.APP()}`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -251,6 +262,18 @@ async function depositEth(weiAmount) {
   const hash = await walletClient.depositEther({
     application:   ADDR.APP(),
     execLayerData: '0x',
+    value:         weiAmount,
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const [inputAdded] = getInputsAdded(receipt);
+  return BigInt(inputAdded.index);
+}
+
+/** Ether deposit with non-empty `execLayerData` (ABI-encoded bytes on the portal). */
+async function depositEthWithExecLayer(weiAmount, execLayerDataHex) {
+  const hash = await walletClient.depositEther({
+    application:   ADDR.APP(),
+    execLayerData: execLayerDataHex,
     value:         weiAmount,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
@@ -320,6 +343,28 @@ async function depositERC721(tokenAddr, tokenId) {
   return BigInt(inputAdded.index);
 }
 
+/** ERC-721 deposit with explicit `baseLayerData` and `execLayerData`. */
+async function depositERC721WithLayerData(tokenAddr, tokenId, baseLayerDataHex, execLayerDataHex) {
+  const approveHash = await walletClient.writeContract({
+    address:      tokenAddr,
+    abi:          ERC721_ABI,
+    functionName: 'approve',
+    args:         [ADDR.ERC721_PORTAL, tokenId],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+  const hash = await walletClient.depositERC721Token({
+    application:    ADDR.APP(),
+    token:          tokenAddr,
+    tokenId,
+    baseLayerData:  baseLayerDataHex,
+    execLayerData:  execLayerDataHex,
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const [inputAdded] = getInputsAdded(receipt);
+  return BigInt(inputAdded.index);
+}
+
 async function depositERC1155Single(tokenAddr, id, amount) {
   const approveHash = await walletClient.writeContract({
     address:      tokenAddr,
@@ -342,6 +387,29 @@ async function depositERC1155Single(tokenAddr, id, amount) {
   return BigInt(inputAdded.index);
 }
 
+/** ERC-1155 single deposit with explicit `baseLayerData` and `execLayerData`. */
+async function depositERC1155SingleWithLayerData(tokenAddr, id, amount, baseLayerDataHex, execLayerDataHex) {
+  const approveHash = await walletClient.writeContract({
+    address:      tokenAddr,
+    abi:          ERC1155_ABI,
+    functionName: 'setApprovalForAll',
+    args:         [ADDR.ERC1155_SINGLE_PORTAL, true],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+  const hash = await walletClient.depositSingleERC1155Token({
+    application:    ADDR.APP(),
+    token:          tokenAddr,
+    tokenId:        id,
+    value:          amount,
+    baseLayerData:  baseLayerDataHex,
+    execLayerData:  execLayerDataHex,
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const [inputAdded] = getInputsAdded(receipt);
+  return BigInt(inputAdded.index);
+}
+
 async function depositERC1155Batch(tokenAddr, ids, amounts) {
   const approveHash = await walletClient.writeContract({
     address:      tokenAddr,
@@ -358,6 +426,29 @@ async function depositERC1155Batch(tokenAddr, ids, amounts) {
     values:         amounts,
     baseLayerData:  '0x',
     execLayerData:  '0x',
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const [inputAdded] = getInputsAdded(receipt);
+  return BigInt(inputAdded.index);
+}
+
+/** ERC-1155 batch deposit with explicit `baseLayerData` and `execLayerData`. */
+async function depositERC1155BatchWithLayerData(tokenAddr, ids, amounts, baseLayerDataHex, execLayerDataHex) {
+  const approveHash = await walletClient.writeContract({
+    address:      tokenAddr,
+    abi:          ERC1155_ABI,
+    functionName: 'setApprovalForAll',
+    args:         [ADDR.ERC1155_BATCH_PORTAL, true],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+  const hash = await walletClient.depositBatchERC1155Token({
+    application:    ADDR.APP(),
+    token:          tokenAddr,
+    tokenIds:       ids,
+    values:         amounts,
+    baseLayerData:  baseLayerDataHex,
+    execLayerData:  execLayerDataHex,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   const [inputAdded] = getInputsAdded(receipt);
@@ -492,8 +583,10 @@ export {
   voucherDest,
   sendInspect,
   inspectReportCount, inspectReportBytes,
-  depositEth, depositERC20, depositERC20WithExecLayer, depositERC721,
-  depositERC1155Single, depositERC1155Batch,
+  depositEth, depositEthWithExecLayer,
+  depositERC20, depositERC20WithExecLayer, depositERC721, depositERC721WithLayerData,
+  depositERC1155Single, depositERC1155SingleWithLayerData,
+  depositERC1155Batch, depositERC1155BatchWithLayerData,
   uint256hex,
   sleep,
 };
