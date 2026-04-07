@@ -20,6 +20,8 @@
 //   erc20_withdraw optional: "valueField":"omit"|"zero_hash"
 //
 // Deposits are auto-detected by msg_sender matching portal addresses.
+// Notices append decoded layer payloads when non-empty: ETH/ERC20 " exec=0x…";
+// ERC721 / ERC1155 " base=0x… exec=0x…".
 //
 // Inspect commands (hex-encoded JSON payload):
 //   {"cmd":"generate_reports","size":<bytes>,"count":<n>}
@@ -371,8 +373,12 @@ static bool emit_exception(httplib::Client &cli, const std::string &payload_hex)
 
 // =============================================================================
 // DEPOSIT PARSERS
-// Rollups v2 InputEncoding: ERC20 uses abi.encodePacked (20+20+32+exec); others
-// below use standard abi.encode or packed layouts as in rollups-contracts.
+// Rollups v2 InputEncoding.sol (see rollups-contracts):
+//   ETH:     abi.encodePacked(sender 20B, value 32B, execLayerData)
+//   ERC20:   abi.encodePacked(token 20B, sender 20B, value 32B, execLayerData)
+//   ERC721:  abi.encodePacked(token 20B, sender 20B, tokenId 32B, abi.encode(base, exec))
+//   1155 S:  abi.encodePacked(token 20B, sender 20B, id 32B, value 32B, abi.encode(base, exec))
+//   1155 B:  abi.encodePacked(token 20B, sender 20B, abi.encode(ids[], amts[], base, exec))
 // =============================================================================
 
 static std::vector<uint8_t> abi_word_at(const std::vector<uint8_t> &data, size_t offset) {
@@ -397,12 +403,52 @@ static uint64_t word_to_uint64(const std::vector<uint8_t> &word) {
     return v;
 }
 
-// ETH: abi.encode(address depositor, uint256 value, bytes execLayerData)
+// ABI-encoded `bytes`: length word at `site`, then `length` bytes (32-byte padded).
+static std::vector<uint8_t> abi_read_bytes_vector(const std::vector<uint8_t> &p, size_t site) {
+    if (site + 32 > p.size()) return {};
+    uint64_t len = word_to_uint64(abi_word_at(p, site));
+    if (len > 0x1000000u) return {};
+    if (site + 32 + len > p.size()) return {};
+    return std::vector<uint8_t>(p.begin() + (ptrdiff_t)(site + 32),
+                                p.begin() + (ptrdiff_t)(site + 32 + len));
+}
+
+// Offset word at `offset_word_pos` points to the length word of a dynamic `bytes` field.
+static std::string abi_hex_of_bytes_at_offset_word(const std::vector<uint8_t> &p, size_t offset_word_pos) {
+    if (offset_word_pos + 32 > p.size()) return "";
+    uint64_t rel = word_to_uint64(abi_word_at(p, offset_word_pos));
+    if (rel + 32 > p.size()) return "";
+    std::vector<uint8_t> data = abi_read_bytes_vector(p, rel);
+    if (data.empty()) return "";
+    return bytes_to_hex(data);
+}
+
+// abi.encode(bytes baseLayerData, bytes execLayerData) starting at `inner_start`.
+static void decode_abi_bytes_pair(const std::vector<uint8_t> &p, size_t inner_start,
+                                  std::string &base_hex, std::string &exec_hex) {
+    base_hex = "";
+    exec_hex = "";
+    if (p.size() < inner_start + 64) return;
+    uint64_t o0 = word_to_uint64(abi_word_at(p, inner_start + 0));
+    uint64_t o1 = word_to_uint64(abi_word_at(p, inner_start + 32));
+    if (inner_start + o0 + 32 > p.size() || inner_start + o1 + 32 > p.size()) return;
+    std::vector<uint8_t> vb = abi_read_bytes_vector(p, inner_start + o0);
+    std::vector<uint8_t> ve = abi_read_bytes_vector(p, inner_start + o1);
+    if (!vb.empty()) base_hex = bytes_to_hex(vb);
+    if (!ve.empty()) exec_hex = bytes_to_hex(ve);
+}
+
+// ETH: encodeEtherDeposit — abi.encodePacked(sender 20B, value 32B, execLayerData)
 static void parse_eth_deposit(const std::vector<uint8_t> &p) {
-    if (p.size() < 96) { std::cerr << "[ETH deposit] payload too short\n"; return; }
+    if (p.size() < 52) { std::cerr << "[ETH deposit] payload too short\n"; return; }
     std::cout << "[ETH deposit]"
-              << " depositor=" << word_to_addr(abi_word_at(p, 0))
-              << " value="     << word_to_uint256(abi_word_at(p, 32)) << std::endl;
+              << " depositor=" << bytes_to_hex(std::vector<uint8_t>(p.begin(), p.begin() + 20))
+              << " value="     << word_to_uint256(abi_word_at(p, 20)) << std::endl;
+}
+
+static std::string decode_eth_exec_layer_hex(const std::vector<uint8_t> &p) {
+    if (p.size() <= 52) return "";
+    return bytes_to_hex(std::vector<uint8_t>(p.begin() + 52, p.end()));
 }
 
 // ERC20: InputEncoding.encodeERC20Deposit (rollups-contracts v2) —
@@ -421,23 +467,33 @@ static std::string decode_erc20_exec_layer_hex(const std::vector<uint8_t> &p) {
     return bytes_to_hex(std::vector<uint8_t>(p.begin() + 72, p.end()));
 }
 
-// ERC721: abi.encode(address token, address sender, uint256 tokenId, bytes baseLayerData, bytes execLayerData)
+// ERC721: packed header 72B then abi.encode(baseLayerData, execLayerData)
 static void parse_erc721_deposit(const std::vector<uint8_t> &p) {
-    if (p.size() < 96) { std::cerr << "[ERC721 deposit] payload too short\n"; return; }
+    if (p.size() < 72) { std::cerr << "[ERC721 deposit] payload too short\n"; return; }
     std::cout << "[ERC721 deposit]"
-              << " token="   << word_to_addr(abi_word_at(p, 0))
-              << " sender="  << word_to_addr(abi_word_at(p, 32))
-              << " tokenId=" << word_to_uint256(abi_word_at(p, 64)) << std::endl;
+              << " token="   << bytes_to_hex(std::vector<uint8_t>(p.begin(), p.begin() + 20))
+              << " sender="  << bytes_to_hex(std::vector<uint8_t>(p.begin() + 20, p.begin() + 40))
+              << " tokenId=" << word_to_uint256(abi_word_at(p, 40)) << std::endl;
 }
 
-// ERC1155 single: abi.encode(address token, address sender, uint256 id, uint256 amount, bytes baseLayerData, bytes execLayerData)
+static void erc721_base_exec_hex(const std::vector<uint8_t> &p, std::string &base_hex, std::string &exec_hex) {
+    static const size_t k_inner = 72;
+    decode_abi_bytes_pair(p, k_inner, base_hex, exec_hex);
+}
+
+// ERC1155 single: packed header 104B then abi.encode(baseLayerData, execLayerData)
 static void parse_erc1155_single_deposit(const std::vector<uint8_t> &p) {
-    if (p.size() < 128) { std::cerr << "[ERC1155 single] payload too short\n"; return; }
+    if (p.size() < 104) { std::cerr << "[ERC1155 single] payload too short\n"; return; }
     std::cout << "[ERC1155 single deposit]"
-              << " token="  << word_to_addr(abi_word_at(p, 0))
-              << " sender=" << word_to_addr(abi_word_at(p, 32))
-              << " id="     << word_to_uint256(abi_word_at(p, 64))
-              << " amount=" << word_to_uint256(abi_word_at(p, 96)) << std::endl;
+              << " token="  << bytes_to_hex(std::vector<uint8_t>(p.begin(), p.begin() + 20))
+              << " sender=" << bytes_to_hex(std::vector<uint8_t>(p.begin() + 20, p.begin() + 40))
+              << " id="     << word_to_uint256(abi_word_at(p, 40))
+              << " amount=" << word_to_uint256(abi_word_at(p, 72)) << std::endl;
+}
+
+static void erc1155_single_base_exec_hex(const std::vector<uint8_t> &p, std::string &base_hex, std::string &exec_hex) {
+    static const size_t k_inner = 104;
+    decode_abi_bytes_pair(p, k_inner, base_hex, exec_hex);
 }
 
 // ERC1155 batch: abi.encode(address token, address sender, uint256[] ids, uint256[] amounts, bytes baseLayerData, bytes execLayerData)
@@ -468,6 +524,20 @@ static void parse_erc1155_batch_deposit(const std::vector<uint8_t> &p) {
             ? word_to_uint256(abi_word_at(p, (size_t)(amts_off + 32 + i * 32))) : "?";
         std::cout << "  [" << i << "] id=" << id << " amount=" << amt << std::endl;
     }
+}
+
+// Offsets to baseLayerData / execLayerData (4th and 5th dynamic fields) relative to `base`.
+static void erc1155_batch_base_exec_hex(const std::vector<uint8_t> &p, size_t base, std::string &base_hex, std::string &exec_hex) {
+    base_hex = "";
+    exec_hex = "";
+    if (p.size() < base + 128) return;
+    uint64_t rel_b = word_to_uint64(abi_word_at(p, base + 64));
+    uint64_t rel_e = word_to_uint64(abi_word_at(p, base + 96));
+    if (base + rel_b + 32 > p.size() || base + rel_e + 32 > p.size()) return;
+    std::vector<uint8_t> vb = abi_read_bytes_vector(p, base + rel_b);
+    std::vector<uint8_t> ve = abi_read_bytes_vector(p, base + rel_e);
+    if (!vb.empty()) base_hex = bytes_to_hex(vb);
+    if (!ve.empty()) exec_hex = bytes_to_hex(ve);
 }
 
 // =============================================================================
@@ -509,7 +579,13 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
 
     if (msg_sender == ADDR_ETH_PORTAL) {
         parse_eth_deposit(raw);
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>({'E','T','H',' ','O','K'})));
+        std::string ack = "ETH OK";
+        std::string exec_h = decode_eth_exec_layer_hex(raw);
+        if (!exec_h.empty()) {
+            ack += " exec=";
+            ack += exec_h;
+        }
+        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
         return "accept";
     }
     if (msg_sender == ADDR_ERC20_PORTAL) {
@@ -525,17 +601,52 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
     }
     if (msg_sender == ADDR_ERC721_PORTAL) {
         parse_erc721_deposit(raw);
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>({'E','R','C','7','2','1',' ','O','K'})));
+        std::string ack = "ERC721 OK";
+        std::string bhx, ehx;
+        erc721_base_exec_hex(raw, bhx, ehx);
+        if (!bhx.empty()) {
+            ack += " base=";
+            ack += bhx;
+        }
+        if (!ehx.empty()) {
+            ack += " exec=";
+            ack += ehx;
+        }
+        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
         return "accept";
     }
     if (msg_sender == ADDR_ERC1155_SINGLE_PORTAL) {
         parse_erc1155_single_deposit(raw);
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>({'1','1','5','5','S',' ','O','K'})));
+        std::string ack = "1155S OK";
+        std::string bhx, ehx;
+        erc1155_single_base_exec_hex(raw, bhx, ehx);
+        if (!bhx.empty()) {
+            ack += " base=";
+            ack += bhx;
+        }
+        if (!ehx.empty()) {
+            ack += " exec=";
+            ack += ehx;
+        }
+        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
         return "accept";
     }
     if (msg_sender == ADDR_ERC1155_BATCH_PORTAL) {
         parse_erc1155_batch_deposit(raw);
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>({'1','1','5','5','B',' ','O','K'})));
+        std::string ack = "1155B OK";
+        const size_t base = 40;
+        std::string bhx, ehx;
+        if (raw.size() >= base + 128)
+            erc1155_batch_base_exec_hex(raw, base, bhx, ehx);
+        if (!bhx.empty()) {
+            ack += " base=";
+            ack += bhx;
+        }
+        if (!ehx.empty()) {
+            ack += " exec=";
+            ack += ehx;
+        }
+        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
         return "accept";
     }
 
