@@ -1,10 +1,11 @@
 /**
  * Tier 1 & 2 (ROLLUPS_V2_TEST_COVERAGE_ROADMAP): exception, advance reports,
  * mixed outputs, JSON-RPC pagination / filters / processed count, voucher value
- * shapes, multi-voucher + L1 order, execLayerData deposits, large voucher payload.
+ * shapes, multi-voucher + L1 order, execLayerData (and baseLayerData) on all
+ * portals, large voucher payload.
  *
- * Requires a freshly built dapp (`cartesi build` / restart) so new advance
- * commands and ERC20 execLayer decoding in dapp.cpp are loaded.
+ * Requires a freshly built dapp (`cartesi build` / restart) so dapp.cpp deposit
+ * decoding (layer echoes in notices) and advance commands are loaded.
  */
 
 import { parseAbi, parseEther } from 'viem';
@@ -12,14 +13,23 @@ import { parseAbi, parseEther } from 'viem';
 import {
   ADDR, deployer,
   publicClient, publicClientL2,
+  walletClient,
   sendAdvance, pollInput,
   mineBlocks, waitForEpochClaimAccepted, getOutputWithProof,
   executeVoucher,
   noticeCount, reportCount, voucherCount,
   noticeText, reportText,
   depositERC20, depositERC20WithExecLayer,
+  depositEthWithExecLayer,
+  depositERC721WithLayerData,
+  depositERC1155SingleWithLayerData,
+  depositERC1155BatchWithLayerData,
   uint256hex,
 } from '../helpers.js';
+
+const MINT721_ABI = parseAbi(['function mint(address,uint256) external']);
+const MINT1155_ABI = parseAbi(['function mint(address,uint256,uint256) external']);
+const MINT1155_BATCH_ABI = parseAbi(['function mintBatch(address,uint256[],uint256[]) external']);
 
 const EPOCH_LENGTH = Number(process.env.EPOCH_LENGTH ?? 5);
 
@@ -159,6 +169,71 @@ describe('ERC-20 deposit with execLayerData', () => {
     expect(input.status).toBe('ACCEPTED');
     expect(noticeText(input, 0)).toContain('exec=');
     expect(noticeText(input, 0)).toContain('beef');
+  });
+});
+
+describe('All portal deposits — execLayerData (and base for ERC-721 / ERC-1155)', () => {
+  const baseHex = '0x01';
+  const execHex = '0xbeef';
+
+  test('ETH — notice echoes exec', async () => {
+    const idx = await depositEthWithExecLayer(parseEther('0.02'), execHex);
+    const input = await pollInput(idx);
+    expect(input.status).toBe('ACCEPTED');
+    const t = noticeText(input, 0);
+    expect(t.startsWith('ETH OK')).toBe(true);
+    expect(t).toContain('exec=');
+    expect(t).toContain('beef');
+  });
+
+  test('ERC721 — notice echoes base and exec', async () => {
+    const tokenId = 88n;
+    await walletClient.writeContract({
+      address: ADDR.TEST_ERC721(), abi: MINT721_ABI, functionName: 'mint', args: [deployer, tokenId],
+    });
+    const idx = await depositERC721WithLayerData(ADDR.TEST_ERC721(), tokenId, baseHex, execHex);
+    const input = await pollInput(idx);
+    expect(input.status).toBe('ACCEPTED');
+    const t = noticeText(input, 0);
+    expect(t.startsWith('ERC721 OK')).toBe(true);
+    expect(t).toContain('base=0x01');
+    expect(t).toContain('exec=');
+    expect(t).toContain('beef');
+  });
+
+  test('ERC1155 single — notice echoes base and exec', async () => {
+    const id = 88n;
+    const amt = 100n;
+    await walletClient.writeContract({
+      address: ADDR.TEST_ERC1155(), abi: MINT1155_ABI, functionName: 'mint', args: [deployer, id, amt],
+    });
+    const idx = await depositERC1155SingleWithLayerData(ADDR.TEST_ERC1155(), id, amt, baseHex, execHex);
+    const input = await pollInput(idx);
+    expect(input.status).toBe('ACCEPTED');
+    const t = noticeText(input, 0);
+    expect(t.startsWith('1155S OK')).toBe(true);
+    expect(t).toContain('base=0x01');
+    expect(t).toContain('exec=');
+    expect(t).toContain('beef');
+  });
+
+  test('ERC1155 batch — notice echoes base and exec', async () => {
+    const ids = [90n, 91n];
+    const amts = [20n, 20n];
+    await walletClient.writeContract({
+      address:      ADDR.TEST_ERC1155(),
+      abi:          MINT1155_BATCH_ABI,
+      functionName: 'mintBatch',
+      args:         [deployer, ids, amts],
+    });
+    const idx = await depositERC1155BatchWithLayerData(ADDR.TEST_ERC1155(), ids, amts, baseHex, execHex);
+    const input = await pollInput(idx);
+    expect(input.status).toBe('ACCEPTED');
+    const t = noticeText(input, 0);
+    expect(t.startsWith('1155B OK')).toBe(true);
+    expect(t).toContain('base=0x01');
+    expect(t).toContain('exec=');
+    expect(t).toContain('beef');
   });
 });
 
