@@ -65,16 +65,16 @@ interface IInputBox {
 
 /// @notice Sends all interaction types to a running Cartesi devnet.
 ///
-/// Required env vars  (all pre-filled from `cartesi address-book` + `cartesi run` output):
+/// Required env vars  (pre-fill from `cartesi address-book` + `cartesi run` output):
 ///   PRIVATE_KEY              — Anvil default key (see README)
 ///   CARTESI_APP_ADDRESS      — shown by `cartesi run`
-///   INPUT_BOX_ADDRESS        — 0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac
-///   ETH_PORTAL_ADDRESS       — 0xA632c5c05812c6a6149B7af5C56117d1D2603828
-///   ERC20_PORTAL_ADDRESS     — 0xACA6586A0Cf05bD831f2501E7B4aea550dA6562D
-///   ERC721_PORTAL_ADDRESS    — 0x9E8851dadb2b77103928518846c4678d48b5e371
-///   ERC1155_SINGLE_PORTAL    — 0x18558398Dd1a8cE20956287a4Da7B76aE7A96662
-///   ERC1155_BATCH_PORTAL     — 0xe246Abb974B307490d9C6932F48EbE79de72338A
-///   TEST_ERC20_ADDRESS       — 0x5138f529B77B4e0a7c84B77E79c4335D31938fed  (pre-deployed TestToken)
+///   INPUT_BOX_ADDRESS        — 0x346B3df038FE9f8380071eC6514D5a83aD143939
+///   ETH_PORTAL_ADDRESS       — 0x8b53327575ac999bdfa8003f4b5134DFF9027516
+///   ERC20_PORTAL_ADDRESS     — 0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1
+///   ERC721_PORTAL_ADDRESS    — 0xcA3a0a47915C12F020CF70B938aCC8e744414cb8
+///   ERC1155_SINGLE_PORTAL    — 0x13663E193673756a02e84b724B8a3422A9a7aab4
+///   ERC1155_BATCH_PORTAL     — 0x3649c5E2De91C69a7Bb80D864f0039da5E511096
+///   TEST_ERC20_ADDRESS       — address of deployed TestERC20
 ///   TEST_ERC721_ADDRESS      — address of deployed TestERC721
 ///   TEST_ERC1155_ADDRESS     — address of deployed TestERC1155
 ///

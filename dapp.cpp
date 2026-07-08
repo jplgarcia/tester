@@ -44,13 +44,14 @@
 #include "3rdparty/picojson/picojson.h"
 
 // =============================================================================
-// PORTAL ADDRESSES  (Cartesi v2.0 — from `cartesi address-book`)
+// PORTAL ADDRESSES  (Cartesi rollups-contracts v3.0.0-alpha.6 — deterministic;
+// same on rollups-node devnet and Base Sepolia. Verified on-chain 2026-06-24.)
 // =============================================================================
-static const std::string ADDR_ETH_PORTAL           = "0xa632c5c05812c6a6149b7af5c56117d1d2603828";
-static const std::string ADDR_ERC20_PORTAL          = "0xaca6586a0cf05bd831f2501e7b4aea550da6562d";
-static const std::string ADDR_ERC721_PORTAL         = "0x9e8851dadb2b77103928518846c4678d48b5e371";
-static const std::string ADDR_ERC1155_SINGLE_PORTAL = "0x18558398dd1a8ce20956287a4da7b76ae7a96662";
-static const std::string ADDR_ERC1155_BATCH_PORTAL  = "0xe246abb974b307490d9c6932f48ebe79de72338a";
+static const std::string ADDR_ETH_PORTAL           = "0x8b53327575ac999bdfa8003f4b5134dff9027516";
+static const std::string ADDR_ERC20_PORTAL          = "0x22e57511c30cce6cdaa742e13ce3b774fdc663b1";
+static const std::string ADDR_ERC721_PORTAL         = "0xca3a0a47915c12f020cf70b938acc8e744414cb8";
+static const std::string ADDR_ERC1155_SINGLE_PORTAL = "0x13663e193673756a02e84b724b8a3422a9a7aab4";
+static const std::string ADDR_ERC1155_BATCH_PORTAL  = "0x3649c5e2de91c69a7bb80d864f0039da5e511096";
 
 // =============================================================================
 // ABI FUNCTION SELECTORS  (keccak256 of canonical signature, first 4 bytes)

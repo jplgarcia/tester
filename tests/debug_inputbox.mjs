@@ -7,8 +7,7 @@ const client = createPublicClient({ chain: foundry, transport: http(ANVIL) });
 
 // Check all events from all known InputBox addresses
 const INPUT_BOXES = [
-  '0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac',
-  '0x59b22D57D4f067708AB0c00552767405926dc768',  // alternative
+  '0x346B3df038FE9f8380071eC6514D5a83aD143939',
 ];
 
 const InputAddedABI = parseAbi(['event InputAdded(address indexed dapp, uint256 indexed inputIndex, address sender, bytes input)']);

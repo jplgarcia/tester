@@ -19,7 +19,7 @@
     "transform": {}
   },
   "dependencies": {
-    "@cartesi/viem": "2.0.0-alpha.29",
+    "@cartesi/viem": "2.0.0-alpha.31",
     "dotenv": "^16.4.7",
     "viem": "^2.0.0"
   },

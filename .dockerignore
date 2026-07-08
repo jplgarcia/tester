@@ -1,2 +1,7 @@
 .cartesi
 dapp
+.DS_Store
+.git
+.github
+contracts
+tests

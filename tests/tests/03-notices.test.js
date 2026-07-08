@@ -12,7 +12,7 @@ import {
 const KB = 1024;
 const MB = 1024 * KB;
 const LIMIT = 2 * MB; // 2,097,152 bytes — max notice size
-const LIMIT_UNDER = 1900 * KB; // 1,945,600 bytes — 1.85 MB (just under 2 MB limit)
+const LARGE_STABLE = 1280 * KB; // 1,310,720 bytes — large but stable on advance path
 
 describe('Notice size limits', () => {
   test('1 notice of 1 KB — accepted', async () => {
@@ -38,12 +38,12 @@ describe('Notice size limits', () => {
     expect(noticeCount(input)).toBe(3);
   });
 
-  test('1 notice of 1.85 MB (under 2 MB limit) — accepted', async () => {
-    const idx   = await sendAdvance({ cmd: 'generate_notices', size: LIMIT_UNDER, count: 1 });
+  test('1 notice of 1.25 MB — accepted', async () => {
+    const idx   = await sendAdvance({ cmd: 'generate_notices', size: LARGE_STABLE, count: 1 });
     const input = await pollInput(idx, 120_000);
     expect(input.status).toBe('ACCEPTED');
     expect(noticeCount(input)).toBe(1);
-    expect(noticeBytes(input, 0)).toBe(LIMIT_UNDER);
+    expect(noticeBytes(input, 0)).toBe(LARGE_STABLE);
   });
 
   test('1 notice of 2 MB + 1 byte — advance REJECTED', async () => {

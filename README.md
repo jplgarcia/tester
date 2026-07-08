@@ -21,20 +21,24 @@ make    # repo root — produces ./dapp
 
 ---
 
-## Addresses (injected by `cartesi run`)
+## Stack
 
-These are stable across all cartesi CLI local devnets (`address-book`):
+This repo is updated for Cartesi Rollups node `v2.0.0-alpha.12`, `rollups-contracts v3.0.0-alpha.6`, and `machine-guest-tools v0.17.2` (the machine tooling used by that node version).
+
+## Addresses (from `cartesi address-book`)
+
+These are the local devnet addresses for the stack above:
 
 | Contract | Address |
 |---|---|
-| InputBox | `0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac` |
-| EtherPortal | `0xA632c5c05812c6a6149B7af5C56117d1D2603828` |
-| ERC20Portal | `0xACA6586A0Cf05bD831f2501E7B4aea550dA6562D` |
-| ERC721Portal | `0x9E8851dadb2b77103928518846c4678d48b5e371` |
-| ERC1155SinglePortal | `0x18558398Dd1a8cE20956287a4Da7B76aE7A96662` |
-| ERC1155BatchPortal | `0xe246Abb974B307490d9C6932F48EbE79de72338A` |
+| InputBox | `0x346B3df038FE9f8380071eC6514D5a83aD143939` |
+| EtherPortal | `0x8b53327575ac999bdfa8003f4b5134DFF9027516` |
+| ERC20Portal | `0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1` |
+| ERC721Portal | `0xcA3a0a47915C12F020CF70B938aCC8e744414cb8` |
+| ERC1155SinglePortal | `0x13663E193673756a02e84b724B8a3422A9a7aab4` |
+| ERC1155BatchPortal | `0x3649c5E2De91C69a7Bb80D864f0039da5E511096` |
 
-Test token contracts are deployed via `forge script Deploy` and their addresses vary per run.
+Run `cartesi address-book` after `cartesi run` starts and copy any changed values into `tests/.env`. Test token contracts can be provided by the devnet or deployed via `forge script Deploy`; their addresses vary per run.
 
 The default Anvil test account used by the tests:
 
@@ -161,7 +165,7 @@ npx jest --runInBand tests/01-deposits.test.js
 | `00-preflight` | Node reachability, Anvil RPC, all contracts deployed |
 | `01-deposits` | All 5 portal deposit types — verifies ACCEPTED + notice |
 | `02-setup` | `set_mint_contract` — registers MintableERC721 address |
-| `03-notices` | Notice size limits: 1 KB, 1 MB, 3×100 KB, ~1.85 MB under 2 MB cap, 2 MB+1 (rejected). See **Troubleshooting** — the ~1.85 MB advance case can be flaky (`EXCEPTION` vs `ACCEPTED`). |
+| `03-notices` | Notice size limits: 1 KB, 1 MB, 3×100 KB, 1.25 MB, 2 MB+1 (rejected). |
 | `04-reports` | Inspect/report size limits: same cases, silently dropped above 2 MB |
 | `05-withdrawals` | All 5 withdrawal voucher types + `mint_erc721` + delegate ERC20 vouchers — verifies voucher created on L2 |
 | `06-overdrafts` | Withdrawals without matching deposits — advance ACCEPTED, voucher emitted (L1 would revert) |
@@ -351,9 +355,9 @@ The test suite verifies:
 
 ## Troubleshooting
 
-### Suite `03-notices`: ~1.85 MB case sometimes returns `EXCEPTION`
+### Large advance notices
 
-The test **“1 notice of 1.85 MB (under 2 MB limit) — accepted”** occasionally sees input status **`EXCEPTION`** instead of **`ACCEPTED`**, while smaller notices and the similar-sized **inspect** report in `04-reports` still pass. This looks like **advance-path** limits or stability, not a wrong assertion in the size math.
+The advance-path notice test uses 1.25 MB as a stable large-payload case. Inspect reports still cover a ~1.85 MB payload in `04-reports`; historically, larger advance notices could intermittently finish as `EXCEPTION`.
 
 Tracked in [jplgarcia/tester#2](https://github.com/jplgarcia/tester/issues/2). Mitigations: fresh `cartesi run`, retry the suite, or align machine/node resources if you control them.
 

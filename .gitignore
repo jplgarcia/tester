@@ -1,5 +1,6 @@
 .cartesi
 dapp
+.DS_Store
 
 # Foundry build & deployment artifacts (contracts/)
 contracts/out/

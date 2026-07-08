@@ -4,7 +4,7 @@ import { dirname, join } from 'path';
 import { createPublicClient, createWalletClient, http, hexToString, toHex, parseAbi } from 'viem';
 import { foundry } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
-import { createCartesiPublicClient, walletActionsL1, publicActionsL1, getInputsAdded } from '@cartesi/viem';
+import { createCartesiPublicClient, walletActionsL1, publicActionsL1 } from '@cartesi/viem';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Shell-exported vars would otherwise win over tests/.env (dotenv default), which
@@ -38,15 +38,17 @@ const PRIVATE_KEY  = process.env.PRIVATE_KEY  || '0xac0974bec39a17e36ba4a6b4d238
 const OTHER_PRIVATE_KEY = process.env.OTHER_PRIVATE_KEY
   || '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
-// Contract addresses — stable for cartesi CLI local devnets
+// Contract addresses for Cartesi Rollups node v2.0.0-alpha.12 +
+// rollups-contracts v3.0.0-alpha.6. Override from .env when running against a
+// different address-book.
 const ADDR = {
   APP:                  () => e('CARTESI_APP_ADDRESS'),
-  INPUT_BOX:            process.env.INPUT_BOX_ADDRESS    || '0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac',
-  ETH_PORTAL:           process.env.ETH_PORTAL_ADDRESS   || '0xA632c5c05812c6a6149B7af5C56117d1D2603828',
-  ERC20_PORTAL:         process.env.ERC20_PORTAL_ADDRESS || '0xACA6586A0Cf05bD831f2501E7B4aea550dA6562D',
-  ERC721_PORTAL:        process.env.ERC721_PORTAL_ADDRESS|| '0x9E8851dadb2b77103928518846c4678d48b5e371',
-  ERC1155_SINGLE_PORTAL:process.env.ERC1155_SINGLE_PORTAL|| '0x18558398Dd1a8cE20956287a4Da7B76aE7A96662',
-  ERC1155_BATCH_PORTAL: process.env.ERC1155_BATCH_PORTAL || '0xe246Abb974B307490d9C6932F48EbE79de72338A',
+  INPUT_BOX:            process.env.INPUT_BOX_ADDRESS    || '0x346B3df038FE9f8380071eC6514D5a83aD143939',
+  ETH_PORTAL:           process.env.ETH_PORTAL_ADDRESS   || '0x8b53327575ac999bdfa8003f4b5134DFF9027516',
+  ERC20_PORTAL:         process.env.ERC20_PORTAL_ADDRESS || '0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1',
+  ERC721_PORTAL:        process.env.ERC721_PORTAL_ADDRESS|| '0xcA3a0a47915C12F020CF70B938aCC8e744414cb8',
+  ERC1155_SINGLE_PORTAL:process.env.ERC1155_SINGLE_PORTAL|| '0x13663E193673756a02e84b724B8a3422A9a7aab4',
+  ERC1155_BATCH_PORTAL: process.env.ERC1155_BATCH_PORTAL || '0x3649c5E2De91C69a7Bb80D864f0039da5E511096',
   TEST_ERC20:           () => e('TEST_ERC20_ADDRESS'),
   TEST_ERC721:          () => e('TEST_ERC721_ADDRESS'),
   TEST_ERC1155:         () => e('TEST_ERC1155_ADDRESS'),
@@ -88,6 +90,28 @@ const deployer = account.address;
 /** Address of `OTHER_PRIVATE_KEY` — use as non-targeted executor in tests. */
 const otherUser = accountOther.address;
 
+function inputIndexFromReceipt(receipt) {
+  const inputBox = ADDR.INPUT_BOX.toLowerCase();
+  const log = receipt.logs.find((entry) =>
+    entry.address.toLowerCase() === inputBox && entry.topics.length >= 3
+  );
+  if (!log) {
+    throw new Error(`InputAdded log not found in transaction ${receipt.transactionHash}`);
+  }
+  return BigInt(log.topics[2]);
+}
+
+const INPUT_BOX_ABI = parseAbi(['function addInput(address appContract, bytes payload) external returns (bytes32)']);
+
+async function addInput(payload) {
+  return walletClient.writeContract({
+    address: ADDR.INPUT_BOX,
+    abi: INPUT_BOX_ABI,
+    functionName: 'addInput',
+    args: [ADDR.APP(), payload],
+  });
+}
+
 // =============================================================================
 // ADVANCE INPUT — send JSON as hex-encoded payload
 // =============================================================================
@@ -98,10 +122,9 @@ const otherUser = accountOther.address;
  */
 async function sendAdvance(json) {
   const payload = toHex(JSON.stringify(json));
-  const hash    = await walletClient.addInput({ application: ADDR.APP(), payload });
+  const hash    = await addInput(payload);
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 /**
@@ -112,10 +135,9 @@ async function sendAdvance(json) {
  */
 async function sendRawInput(rawString) {
   const payload = toHex(rawString);
-  const hash    = await walletClient.addInput({ application: ADDR.APP(), payload });
+  const hash    = await addInput(payload);
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 // =============================================================================
@@ -257,28 +279,35 @@ const inspectReportBytes = (resp, n = 0) => {
 const ERC20_ABI   = parseAbi(['function approve(address spender, uint256 amount) external returns (bool)']);
 const ERC721_ABI  = parseAbi(['function approve(address to, uint256 tokenId) external']);
 const ERC1155_ABI = parseAbi(['function setApprovalForAll(address operator, bool approved) external']);
+const ETHER_PORTAL_ABI = parseAbi(['function depositEther(address appContract, bytes execLayerData) external payable']);
+const ERC20_PORTAL_ABI = parseAbi(['function depositERC20Tokens(address token, address appContract, uint256 value, bytes execLayerData) external']);
+const ERC721_PORTAL_ABI = parseAbi(['function depositERC721Token(address token, address appContract, uint256 tokenId, bytes baseLayerData, bytes execLayerData) external']);
+const ERC1155_SINGLE_PORTAL_ABI = parseAbi(['function depositSingleERC1155Token(address token, address appContract, uint256 id, uint256 amount, bytes baseLayerData, bytes execLayerData) external']);
+const ERC1155_BATCH_PORTAL_ABI = parseAbi(['function depositBatchERC1155Token(address token, address appContract, uint256[] ids, uint256[] amounts, bytes baseLayerData, bytes execLayerData) external']);
 
 async function depositEth(weiAmount) {
-  const hash = await walletClient.depositEther({
-    application:   ADDR.APP(),
-    execLayerData: '0x',
-    value:         weiAmount,
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ETH_PORTAL,
+    abi:          ETHER_PORTAL_ABI,
+    functionName: 'depositEther',
+    args:         [ADDR.APP(), '0x'],
+    value:        weiAmount,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 /** Ether deposit with non-empty `execLayerData` (ABI-encoded bytes on the portal). */
 async function depositEthWithExecLayer(weiAmount, execLayerDataHex) {
-  const hash = await walletClient.depositEther({
-    application:   ADDR.APP(),
-    execLayerData: execLayerDataHex,
-    value:         weiAmount,
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ETH_PORTAL,
+    abi:          ETHER_PORTAL_ABI,
+    functionName: 'depositEther',
+    args:         [ADDR.APP(), execLayerDataHex],
+    value:        weiAmount,
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 async function depositERC20(tokenAddr, amount) {
@@ -290,15 +319,14 @@ async function depositERC20(tokenAddr, amount) {
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositERC20Tokens({
-    application:   ADDR.APP(),
-    token:         tokenAddr,
-    amount,
-    execLayerData: '0x',
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC20_PORTAL,
+    abi:          ERC20_PORTAL_ABI,
+    functionName: 'depositERC20Tokens',
+    args:         [tokenAddr, ADDR.APP(), amount, '0x'],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 /** ERC-20 deposit with non-empty `execLayerData` (ABI-encoded bytes on the portal). */
@@ -311,15 +339,14 @@ async function depositERC20WithExecLayer(tokenAddr, amount, execLayerDataHex) {
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositERC20Tokens({
-    application:   ADDR.APP(),
-    token:         tokenAddr,
-    amount,
-    execLayerData: execLayerDataHex,
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC20_PORTAL,
+    abi:          ERC20_PORTAL_ABI,
+    functionName: 'depositERC20Tokens',
+    args:         [tokenAddr, ADDR.APP(), amount, execLayerDataHex],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 async function depositERC721(tokenAddr, tokenId) {
@@ -331,16 +358,14 @@ async function depositERC721(tokenAddr, tokenId) {
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositERC721Token({
-    application:    ADDR.APP(),
-    token:          tokenAddr,
-    tokenId,
-    baseLayerData:  '0x',
-    execLayerData:  '0x',
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC721_PORTAL,
+    abi:          ERC721_PORTAL_ABI,
+    functionName: 'depositERC721Token',
+    args:         [tokenAddr, ADDR.APP(), tokenId, '0x', '0x'],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 /** ERC-721 deposit with explicit `baseLayerData` and `execLayerData`. */
@@ -353,16 +378,14 @@ async function depositERC721WithLayerData(tokenAddr, tokenId, baseLayerDataHex, 
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositERC721Token({
-    application:    ADDR.APP(),
-    token:          tokenAddr,
-    tokenId,
-    baseLayerData:  baseLayerDataHex,
-    execLayerData:  execLayerDataHex,
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC721_PORTAL,
+    abi:          ERC721_PORTAL_ABI,
+    functionName: 'depositERC721Token',
+    args:         [tokenAddr, ADDR.APP(), tokenId, baseLayerDataHex, execLayerDataHex],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 async function depositERC1155Single(tokenAddr, id, amount) {
@@ -374,17 +397,14 @@ async function depositERC1155Single(tokenAddr, id, amount) {
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositSingleERC1155Token({
-    application:    ADDR.APP(),
-    token:          tokenAddr,
-    tokenId:        id,
-    value:          amount,
-    baseLayerData:  '0x',
-    execLayerData:  '0x',
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC1155_SINGLE_PORTAL,
+    abi:          ERC1155_SINGLE_PORTAL_ABI,
+    functionName: 'depositSingleERC1155Token',
+    args:         [tokenAddr, ADDR.APP(), id, amount, '0x', '0x'],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 /** ERC-1155 single deposit with explicit `baseLayerData` and `execLayerData`. */
@@ -397,17 +417,14 @@ async function depositERC1155SingleWithLayerData(tokenAddr, id, amount, baseLaye
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositSingleERC1155Token({
-    application:    ADDR.APP(),
-    token:          tokenAddr,
-    tokenId:        id,
-    value:          amount,
-    baseLayerData:  baseLayerDataHex,
-    execLayerData:  execLayerDataHex,
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC1155_SINGLE_PORTAL,
+    abi:          ERC1155_SINGLE_PORTAL_ABI,
+    functionName: 'depositSingleERC1155Token',
+    args:         [tokenAddr, ADDR.APP(), id, amount, baseLayerDataHex, execLayerDataHex],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 async function depositERC1155Batch(tokenAddr, ids, amounts) {
@@ -419,17 +436,14 @@ async function depositERC1155Batch(tokenAddr, ids, amounts) {
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositBatchERC1155Token({
-    application:    ADDR.APP(),
-    token:          tokenAddr,
-    tokenIds:       ids,
-    values:         amounts,
-    baseLayerData:  '0x',
-    execLayerData:  '0x',
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC1155_BATCH_PORTAL,
+    abi:          ERC1155_BATCH_PORTAL_ABI,
+    functionName: 'depositBatchERC1155Token',
+    args:         [tokenAddr, ADDR.APP(), ids, amounts, '0x', '0x'],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 /** ERC-1155 batch deposit with explicit `baseLayerData` and `execLayerData`. */
@@ -442,17 +456,14 @@ async function depositERC1155BatchWithLayerData(tokenAddr, ids, amounts, baseLay
   });
   await publicClient.waitForTransactionReceipt({ hash: approveHash });
 
-  const hash = await walletClient.depositBatchERC1155Token({
-    application:    ADDR.APP(),
-    token:          tokenAddr,
-    tokenIds:       ids,
-    values:         amounts,
-    baseLayerData:  baseLayerDataHex,
-    execLayerData:  execLayerDataHex,
+  const hash = await walletClient.writeContract({
+    address:      ADDR.ERC1155_BATCH_PORTAL,
+    abi:          ERC1155_BATCH_PORTAL_ABI,
+    functionName: 'depositBatchERC1155Token',
+    args:         [tokenAddr, ADDR.APP(), ids, amounts, baseLayerDataHex, execLayerDataHex],
   });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const [inputAdded] = getInputsAdded(receipt);
-  return BigInt(inputAdded.index);
+  return inputIndexFromReceipt(receipt);
 }
 
 // =============================================================================
@@ -590,4 +601,3 @@ export {
   uint256hex,
   sleep,
 };
-

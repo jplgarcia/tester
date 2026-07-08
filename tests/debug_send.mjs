@@ -5,8 +5,8 @@ import { walletActionsL1, publicActionsL1, getInputsAdded } from '@cartesi/viem'
 
 const PRIVATE_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const RPC_URL = 'http://127.0.0.1:6751/anvil';
-const APP = '0x618f4c02eeaca01fb7c18ff8874c77fdca7bda9a';
-const INPUT_BOX = '0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac';
+const APP = process.env.CARTESI_APP_ADDRESS || '0xc192bb886f77807f0101ecc7566e653ac03b0b19';
+const INPUT_BOX = process.env.INPUT_BOX_ADDRESS || '0x346B3df038FE9f8380071eC6514D5a83aD143939';
 
 const account = privateKeyToAccount(PRIVATE_KEY);
 const publicClient = createPublicClient({ chain: foundry, transport: http(RPC_URL) }).extend(publicActionsL1());
