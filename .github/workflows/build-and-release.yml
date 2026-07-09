@@ -39,7 +39,7 @@ jobs:
           node-version: current
 
       - name: Install Cartesi CLI
-        run: npm install -g @cartesi/cli@2.0.0-alpha.16
+        run: npm install -g @cartesi/cli@2.0.0-alpha.35
 
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/')
