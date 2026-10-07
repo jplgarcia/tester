@@ -1,12 +1,6 @@
-.PHONY: clean
+.PHONY: all clean
 
-all: cpp-httplib picojson
-
-cpp-httplib:
-	curl -fsSL -O https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.10.4.tar.gz && \
-  tar xvf v0.10.4.tar.gz && \
-  rm v0.10.4.tar.gz && \
-  mv cpp-httplib-0.10.4 cpp-httplib
+all: picojson
 
 picojson:
 	curl -fsSL -O https://github.com/kazuho/picojson/archive/refs/tags/v1.3.0.tar.gz && \
@@ -15,4 +9,4 @@ picojson:
   mv picojson-1.3.0 picojson
 
 clean:
-	rm -rf picojson cpp-httplib
+	rm -rf picojson

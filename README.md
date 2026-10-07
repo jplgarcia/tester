@@ -2,11 +2,7 @@
 
 A C++ Cartesi v2 dapp for exercising all rollup primitives: every deposit type, every withdrawal type (via vouchers), delegate-call vouchers, configurable notice/report generation, exception registration, mixed outputs per advance, and an ERC721 voucher-mint flow. Integration tests cover JSON-RPC pagination, ERC-20 `execLayerData` deposits (Rollups v2 `InputEncoding` packed payload), large vouchers, and multi-voucher L1 ordering.
 
-After changing **`dapp.cpp`**, rebuild the binary before `cartesi build`:
-
-```bash
-make    # repo root — produces ./dapp
-```
+The dapp talks to the machine through **libcmt** (the C library shipped in machine-guest-tools), not through `rollup-http-server`. Outputs are encoded straight into the 2 MiB CMIO transmit buffer, so there is no HTTP/JSON body limit in the way and very large requests cannot kill the dapp with `SIGPIPE`; an output that does not fit the buffer makes the emit call return `-ENOBUFS` (`-105`) and the dapp rejects the input. The machine entrypoint is the dapp binary itself (`/opt/cartesi/dapp/dapp`): if it exits, the machine halts.
 
 ---
 
@@ -204,7 +200,7 @@ Emits a notice confirming the address.
 ---
 
 #### `generate_notices`
-Generate N notices of a given byte size. Sizes up to **2,097,152 bytes (2 MB)** are accepted. Larger sizes cause the advance to be **rejected**.
+Generate N notices of a given byte size (payload pattern `i & 0xff`). Payloads up to **2,097,056 bytes** fit the 2 MiB output buffer once ABI-encoded; larger sizes cause the advance to be **rejected**.
 ```json
 {"cmd":"generate_notices","size":1024,"count":3}
 ```
@@ -212,7 +208,7 @@ Generate N notices of a given byte size. Sizes up to **2,097,152 bytes (2 MB)** 
 ---
 
 #### `force_exception`
-Registers an **exception** for the current input (HTTP `POST` to the rollup **`/exception`** endpoint). The input finishes with status **`EXCEPTION`** (not `ACCEPTED`).
+Raises an **exception** for the current input (libcmt `cmt_rollup_emit_exception`, payload = `message`). The input finishes with status **`EXCEPTION`** (not `ACCEPTED`) and the application becomes `GUEST_EXCEPTION` (terminal), so use a throwaway app.
 ```json
 {"cmd":"force_exception","message":"optional reason"}
 ```
@@ -367,9 +363,7 @@ The test suite verifies:
 
 ### Large advance notices
 
-The advance-path notice test uses 1.25 MB as a stable large-payload case. Inspect reports still cover a ~1.85 MB payload in `04-reports`; historically, larger advance notices could intermittently finish as `EXCEPTION`.
-
-Tracked in [jplgarcia/tester#2](https://github.com/jplgarcia/tester/issues/2). Mitigations: fresh `cartesi run`, retry the suite, or align machine/node resources if you control them.
+With `rollup-http-server` (versions of this dapp before libcmt), a notice above ~2.6 MB made the 6 MB hex JSON body exceed the server's 5 MiB limit; the server answered `400` before reading the body, the dapp died of `SIGPIPE` and the input ended as `EXCEPTION` (terminal app), see [jplgarcia/tester#2](https://github.com/jplgarcia/tester/issues/2). The libcmt build has no such path: any size that does not fit the 2 MiB buffer is a clean `REJECTED`.
 
 ### `forge script` fails with "environment variable not found"
 
@@ -419,10 +413,14 @@ curl -s http://localhost:6751/anvil -X POST -H "Content-Type: application/json" 
 # If result is "0x0", wait a few more seconds and try again
 ```
 
-| Output | Max payload |
-|---|---|
-| Notice | 2,097,152 bytes (2 MB) |
-| Report | 2,097,152 bytes (2 MB) |
-| Voucher calldata | 2,097,152 bytes (2 MB) |
+### Output size limits
 
-Exceeding the limit causes the rollup server to reject the `/notice` or `/report` POST, which this dapp propagates as a rejected advance input for notices, and as a silently truncated run (no more reports) for inspect.
+| Output | Encoded as | Max payload |
+|---|---|---|
+| Notice | `Notice(bytes)`: 4 + 32 + 32 + payload padded to 32 | 2,097,056 bytes |
+| Voucher calldata | `Voucher(address,uint256,bytes)`: 4 + 4*32 + payload padded to 32 | 2,096,992 bytes |
+| Report | raw bytes | 2,097,152 bytes |
+
+The limit is on the **encoded** output: the whole output must fit the 2,097,152-byte CMIO transmit buffer. A notice/voucher adds its ABI header and 32-byte padding, so the largest notice payload is **2,097,056** bytes (`68 + 32*ceil(n/32) <= 2097152`); a payload of exactly 2 MiB is rejected. Reports are written raw (no header), so a 2,097,152-byte report fits.
+
+Exceeding the limit makes libcmt return `-ENOBUFS` (`-105`), which this dapp propagates as a rejected advance input for notices/reports, and as a silently truncated run (no more reports) for inspect.

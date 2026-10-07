@@ -1,11 +1,18 @@
-CXX  := g++
+CXX := g++
+CXXFLAGS := -std=c++17 -O2
+
+# libcmt (headers + static library) ships in the machine-guest-tools .deb.
+# The Dockerfile unpacks the pinned .deb and passes its prefix here.
+LIBCMT_PREFIX ?= /usr
 
 .PHONY: clean 3rdparty
 
-dapp: dapp.cpp
-	make -C 3rdparty
-	$(CXX) -pthread -std=c++11 -o $@ $^
+dapp: dapp.cpp 3rdparty
+	$(CXX) $(CXXFLAGS) -I$(LIBCMT_PREFIX)/include -o $@ dapp.cpp $(LIBCMT_PREFIX)/lib/libcmt.a
+
+3rdparty:
+	$(MAKE) -C 3rdparty
 
 clean:
 	@rm -rf dapp
-	make -C 3rdparty clean
+	$(MAKE) -C 3rdparty clean

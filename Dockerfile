@@ -39,9 +39,17 @@ apt-get install -y --no-install-recommends \
 rm -rf /var/lib/apt/lists/*
 EOF
 
+# libcmt (static library + headers) from the same pinned machine-guest-tools .deb
+ARG MACHINE_GUEST_TOOLS_VERSION
+ARG MACHINE_GUEST_TOOLS_SHA256SUM
+ADD --checksum=sha256:${MACHINE_GUEST_TOOLS_SHA256SUM} \
+  https://github.com/cartesi/machine-guest-tools/releases/download/v${MACHINE_GUEST_TOOLS_VERSION}/machine-guest-tools_riscv64.deb \
+  /tmp/machine-guest-tools_riscv64.deb
+RUN dpkg -x /tmp/machine-guest-tools_riscv64.deb /opt/libcmt
+
 WORKDIR /opt/cartesi/dapp
 COPY . .
-RUN make
+RUN make LIBCMT_PREFIX=/opt/libcmt/usr
 
 ################################################################################
 # runtime stage: produces final image that will be executed
@@ -69,7 +77,5 @@ ENV PATH="/opt/cartesi/bin:${PATH}"
 WORKDIR /opt/cartesi/dapp
 COPY --from=builder /opt/cartesi/dapp/dapp .
 
-ENV ROLLUP_HTTP_SERVER_URL="http://127.0.0.1:5004"
-
-ENTRYPOINT ["rollup-init"]
-CMD ["/opt/cartesi/dapp/dapp"]
+# The dapp uses libcmt directly (no rollup-http-server / rollup-init).
+ENTRYPOINT ["/opt/cartesi/dapp/dapp"]

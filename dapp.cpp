@@ -1,7 +1,11 @@
 // =============================================================================
 // Cartesi v2.0 Test DApp
 //
-// Advance commands (hex-encoded JSON payload):
+// Talks to the Cartesi Machine through libcmt (machine-guest-tools), not
+// through rollup-http-server: outputs are written straight into the CMIO
+// transmit buffer, so the only size limit is the 2 MiB buffer itself.
+//
+// Advance commands (payload = UTF-8 JSON bytes):
 //   {"cmd":"set_mint_contract","address":"0x..."}
 //   {"cmd":"generate_notices","size":<bytes>,"count":<n>}
 //   {"cmd":"eth_withdraw","receiver":"0x...","amount":"0x<uint256>"}
@@ -12,7 +16,7 @@
 //   {"cmd":"mint_erc721","receiver":"0x...","tokenId":"0x<uint256>"}
 //   {"cmd":"delegate_erc20_transfer","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x<uint256>"}
 //   {"cmd":"delegate_erc20_transfer_targeted","logic":"0x...","token":"0x...","receiver":"0x...","amount":"0x<uint256>","allowedExecutor":"0x..."}
-//   {"cmd":"force_exception","message":"..."}   → POST /exception (input status EXCEPTION)
+//   {"cmd":"force_exception","message":"..."}   → exception yield (input status EXCEPTION)
 //   {"cmd":"advance_reports","size":<bytes>,"count":<n>}
 //   {"cmd":"mixed_outputs","token":"0x...","receiver":"0x...","amount":"0x...", optional noticeText, reportText}
 //   {"cmd":"multi_erc20_withdraw","token":"0x...","receiver":"0x...","amountFirst":"0x...","amountSecond":"0x..."}
@@ -23,7 +27,8 @@
 // Notices append decoded layer payloads when non-empty: ETH/ERC20 " exec=0x…";
 // ERC721 / ERC1155 " base=0x… exec=0x…".
 //
-// Inspect commands (hex-encoded JSON payload):
+// Inspect commands (payload = UTF-8 JSON bytes, optionally wrapped in
+// {"payload":"0x<hex of the JSON>"}):
 //   {"cmd":"generate_reports","size":<bytes>,"count":<n>}
 //   {"cmd":"echo"}  → reports back the raw payload as a report
 //
@@ -36,11 +41,15 @@
 #include <map>
 #include <sstream>
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <cstdint>
 #include <stdexcept>
 
-#include "3rdparty/cpp-httplib/httplib.h"
+extern "C" {
+#include <libcmt/rollup.h>
+}
+
 #include "3rdparty/picojson/picojson.h"
 
 // =============================================================================
@@ -301,76 +310,101 @@ static std::vector<uint8_t> build_eth_withdraw(
 }
 
 // =============================================================================
-// ROLLUP HTTP HELPERS
+// ROLLUP I/O (libcmt)
 // =============================================================================
-// Returns true on success, false if the rollup server rejected the payload
-// (e.g. payload exceeds the 2 MB per-output limit).
-static bool emit_notice(httplib::Client &cli, const std::string &payload_hex) {
-    std::string body = "{\"payload\":\"" + payload_hex + "\"}";
-    auto res = cli.Post("/notice", body, "application/json");
-    if (!res || res->status >= 400) {
-        std::cerr << "[notice] emit failed (status="
-                  << (res ? std::to_string(res->status) : "no response") << ")\n";
-        return false;
-    }
+// Every emit returns true on success and false when libcmt refuses the output
+// (e.g. -ENOBUFS: the encoded output does not fit the 2 MiB CMIO tx buffer).
+// The last return code is kept in g_last_rc so callers can report it.
+static cmt_rollup_t g_rollup;
+static int g_last_rc = 0;
+
+static std::vector<uint8_t> str_bytes(const std::string &s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+static cmt_abi_bytes_t abi_bytes(const std::vector<uint8_t> &v) {
+    cmt_abi_bytes_t b;
+    b.length = v.size();
+    b.data = (void *)v.data();
+    return b;
+}
+
+static bool check_rc(const char *what, int rc) {
+    g_last_rc = rc;
+    if (rc == 0) return true;
+    std::cerr << "[" << what << "] emit failed rc=" << rc << " (" << strerror(-rc) << ")\n";
+    return false;
+}
+
+// 20-byte address from hex; false if it is not exactly 20 bytes.
+static bool parse_address(const std::string &hex, cmt_abi_address_t &out) {
+    std::vector<uint8_t> b = hex_to_bytes(hex);
+    if (b.size() != CMT_ABI_ADDRESS_LENGTH) return false;
+    memcpy(out.data, b.data(), CMT_ABI_ADDRESS_LENGTH);
     return true;
 }
 
-static bool emit_report(httplib::Client &cli, const std::string &payload_hex) {
-    std::string body = "{\"payload\":\"" + payload_hex + "\"}";
-    auto res = cli.Post("/report", body, "application/json");
-    if (!res || res->status >= 400) {
-        std::cerr << "[report] emit failed (status="
-                  << (res ? std::to_string(res->status) : "no response") << ")\n";
-        return false;
-    }
+// Big-endian uint256 from hex (left-padded); false if it needs more than 32 bytes.
+static bool parse_u256(const std::string &hex, cmt_abi_u256_t &out) {
+    std::vector<uint8_t> b = hex_to_bytes(hex);
+    size_t skip = 0;
+    while (b.size() - skip > CMT_ABI_U256_LENGTH && b[skip] == 0) skip++;
+    if (b.size() - skip > CMT_ABI_U256_LENGTH) return false;
+    memset(out.data, 0, CMT_ABI_U256_LENGTH);
+    memcpy(out.data + CMT_ABI_U256_LENGTH - (b.size() - skip), b.data() + skip, b.size() - skip);
     return true;
 }
 
-static bool emit_voucher(httplib::Client &cli,
-                         const std::string &destination,
-                         const std::string &payload_hex,
+static bool emit_notice(const std::vector<uint8_t> &payload) {
+    cmt_abi_bytes_t p = abi_bytes(payload);
+    return check_rc("notice", cmt_rollup_emit_notice(&g_rollup, &p, nullptr));
+}
+
+static bool emit_report(const std::vector<uint8_t> &payload) {
+    cmt_abi_bytes_t p = abi_bytes(payload);
+    return check_rc("report", cmt_rollup_emit_report(&g_rollup, &p));
+}
+
+// Voucher(destination, value, payload). An empty value_hex means value 0.
+static bool emit_voucher(const std::string &destination,
+                         const std::vector<uint8_t> &payload,
                          const std::string &value_hex = "")
 {
-    std::string body;
-    if (value_hex.empty()) {
-        body = "{\"destination\":\"" + destination
-              + "\",\"payload\":\"" + payload_hex + "\"}";
-    } else {
-        // value_hex must be 64 hex chars (32 bytes); rollup server requires 0x prefix
-        body = "{\"destination\":\"" + destination
-              + "\",\"payload\":\"" + payload_hex
-              + "\",\"value\":\"0x" + value_hex + "\"}";  
-    }
-    auto res = cli.Post("/voucher", body, "application/json");
-    if (!res || res->status >= 400) {
-        std::cerr << "[voucher] emit failed\n";
+    cmt_abi_address_t dst;
+    cmt_abi_u256_t value;
+    if (!parse_address(destination, dst)) {
+        std::cerr << "[voucher] invalid destination " << destination << "\n";
+        g_last_rc = -EINVAL;
         return false;
     }
-    return true;
+    if (!parse_u256(value_hex, value)) {
+        std::cerr << "[voucher] invalid value " << value_hex << "\n";
+        g_last_rc = -EINVAL;
+        return false;
+    }
+    cmt_abi_bytes_t p = abi_bytes(payload);
+    return check_rc("voucher", cmt_rollup_emit_voucher(&g_rollup, &dst, &value, &p, nullptr));
 }
 
-static void emit_delegate_voucher(httplib::Client &cli,
-                                  const std::string &destination,
-                                  const std::string &payload_hex)
+static bool emit_delegate_voucher(const std::string &destination,
+                                  const std::vector<uint8_t> &payload)
 {
-    std::string body = "{\"destination\":\"" + destination
-          + "\",\"payload\":\"" + payload_hex + "\"}";
-    auto res = cli.Post("/delegate-call-voucher", body, "application/json");
-    if (!res || res->status >= 400)
-        std::cerr << "[delegate-call-voucher] emit failed\n";
-}
-
-// Register EXCEPTION for the current input (must be last rollup HTTP call in handler).
-static bool emit_exception(httplib::Client &cli, const std::string &payload_hex) {
-    std::string body = "{\"payload\":\"" + payload_hex + "\"}";
-    auto res = cli.Post("/exception", body, "application/json");
-    if (!res || res->status < 200 || res->status >= 300) {
-        std::cerr << "[exception] emit failed (status="
-                  << (res ? std::to_string(res->status) : "no response") << ")\n";
+    cmt_abi_address_t dst;
+    if (!parse_address(destination, dst)) {
+        std::cerr << "[delegate-call-voucher] invalid destination " << destination << "\n";
+        g_last_rc = -EINVAL;
         return false;
     }
-    return true;
+    cmt_abi_bytes_t p = abi_bytes(payload);
+    return check_rc("delegate-call-voucher",
+                    cmt_rollup_emit_delegate_call_voucher(&g_rollup, &dst, &p, nullptr));
+}
+
+// Exception yield: the node marks the request EXCEPTION (advance: terminal
+// GUEST_EXCEPTION; inspect: status "Exception" with exception_data = payload).
+static bool emit_exception(const std::vector<uint8_t> &payload) {
+    cmt_abi_bytes_t p = abi_bytes(payload);
+    return check_rc("exception", cmt_rollup_emit_exception(&g_rollup, &p));
 }
 
 // =============================================================================
@@ -546,39 +580,33 @@ static void erc1155_batch_base_exec_hex(const std::vector<uint8_t> &p, size_t ba
 // PAYLOAD HELPERS
 // =============================================================================
 
-// Generate a test payload of exactly `size` bytes (repeating pattern)
-static std::string make_payload(size_t size_bytes) {
+// Generate a test payload of exactly `size` bytes (repeating pattern i & 0xff)
+static std::vector<uint8_t> make_payload(size_t size_bytes) {
     std::vector<uint8_t> data(size_bytes);
     for (size_t i = 0; i < size_bytes; i++)
         data[i] = (uint8_t)(i & 0xff);
-    return bytes_to_hex(data);
-}
-
-// Decode hex payload into a UTF-8 string (for JSON parsing)
-static std::string hex_payload_to_string(const std::string &hex_payload) {
-    std::vector<uint8_t> bytes = hex_to_bytes(hex_payload);
-    return std::string(bytes.begin(), bytes.end());
+    return data;
 }
 
 // =============================================================================
 // ADVANCE HANDLER
 // =============================================================================
-static std::string handle_advance(httplib::Client &cli, picojson::value data) {
-    picojson::value metadata  = data.get("metadata");
-    std::string msg_sender    = to_lower(metadata.get("msg_sender").get<std::string>());
-    std::string payload_hex   = data.get("payload").get<std::string>();
+static std::string handle_advance(const cmt_rollup_advance_t &adv) {
+    std::string msg_sender = to_lower(bytes_to_hex(std::vector<uint8_t>(
+        adv.msg_sender.data, adv.msg_sender.data + CMT_ABI_ADDRESS_LENGTH)));
+    const uint8_t *pl = (const uint8_t *)adv.payload.data;
+    std::vector<uint8_t> raw(pl, pl + adv.payload.length);
 
     // Record the app's own address the first time we see it
-    if (g_app_address.empty() && metadata.contains("app_contract")) {
-        g_app_address = to_lower(metadata.get("app_contract").get<std::string>());
+    if (g_app_address.empty()) {
+        g_app_address = to_lower(bytes_to_hex(std::vector<uint8_t>(
+            adv.app_contract.data, adv.app_contract.data + CMT_ABI_ADDRESS_LENGTH)));
         std::cout << "[advance] app_address=" << g_app_address << std::endl;
     }
 
-    std::cout << "[advance] msg_sender=" << msg_sender << std::endl;
+    std::cout << "[advance] index=" << adv.index << " msg_sender=" << msg_sender << std::endl;
 
     // ── Detect deposits by msg_sender matching a portal address ───────────
-    std::vector<uint8_t> raw = hex_to_bytes(payload_hex);
-
     if (msg_sender == ADDR_ETH_PORTAL) {
         parse_eth_deposit(raw);
         std::string ack = "ETH OK";
@@ -587,7 +615,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
             ack += " exec=";
             ack += exec_h;
         }
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
+        emit_notice(str_bytes(ack));
         return "accept";
     }
     if (msg_sender == ADDR_ERC20_PORTAL) {
@@ -598,7 +626,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
             ack += " exec=";
             ack += exec_hex;
         }
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
+        emit_notice(str_bytes(ack));
         return "accept";
     }
     if (msg_sender == ADDR_ERC721_PORTAL) {
@@ -614,7 +642,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
             ack += " exec=";
             ack += ehx;
         }
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
+        emit_notice(str_bytes(ack));
         return "accept";
     }
     if (msg_sender == ADDR_ERC1155_SINGLE_PORTAL) {
@@ -630,7 +658,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
             ack += " exec=";
             ack += ehx;
         }
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
+        emit_notice(str_bytes(ack));
         return "accept";
     }
     if (msg_sender == ADDR_ERC1155_BATCH_PORTAL) {
@@ -648,12 +676,12 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
             ack += " exec=";
             ack += ehx;
         }
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ack.begin(), ack.end())));
+        emit_notice(str_bytes(ack));
         return "accept";
     }
 
     // ── Regular JSON input ─────────────────────────────────────────────────
-    std::string json_str = hex_payload_to_string(payload_hex);
+    std::string json_str(raw.begin(), raw.end());
     picojson::value input;
     std::string parse_err = picojson::parse(input, json_str);
     if (!parse_err.empty() || !input.is<picojson::object>()) {
@@ -673,8 +701,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
     if (cmd == "set_mint_contract") {
         g_mint_contract = to_lower(input.get("address").get<std::string>());
         std::cout << "[advance] mint_contract=" << g_mint_contract << std::endl;
-        std::string msg = "mint_contract=" + g_mint_contract;
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(msg.begin(), msg.end())));
+        emit_notice(str_bytes("mint_contract=" + g_mint_contract));
         return "accept";
     }
 
@@ -682,11 +709,11 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
     if (cmd == "generate_notices") {
         size_t sz    = (size_t)input.get("size").get<double>();
         size_t count = (size_t)input.get("count").get<double>();
-        std::string payload = make_payload(sz);
+        std::vector<uint8_t> payload = make_payload(sz);
         std::cout << "[advance] generating " << count
                   << " notices of " << sz << " bytes" << std::endl;
         for (size_t i = 0; i < count; i++) {
-            if (!emit_notice(cli, payload)) {
+            if (!emit_notice(payload)) {
                 std::cerr << "[advance] notice " << i << " rejected (too large?)\n";
                 return "reject";
             }
@@ -694,24 +721,24 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         return "accept";
     }
 
-    // force_exception — POST /exception; input completes as EXCEPTION (last HTTP call)
+    // force_exception — exception yield; input completes as EXCEPTION
     if (cmd == "force_exception") {
         std::string msg = input.contains("message")
             ? input.get("message").get<std::string>()
             : std::string("test_exception");
-        std::vector<uint8_t> mb(msg.begin(), msg.end());
-        if (!emit_exception(cli, bytes_to_hex(mb))) return "reject";
-        std::cout << "[advance] registered exception payload len=" << mb.size() << std::endl;
+        std::vector<uint8_t> mb = str_bytes(msg);
+        std::cout << "[advance] raising exception payload len=" << mb.size() << std::endl;
+        if (!emit_exception(mb)) return "reject";
         return "accept";
     }
 
-    // advance_reports — emit /report during an advance (same limits as notices)
+    // advance_reports — emit reports during an advance (same limits as notices)
     if (cmd == "advance_reports") {
         size_t sz    = (size_t)input.get("size").get<double>();
         size_t count = (size_t)input.get("count").get<double>();
-        std::string payload = make_payload(sz);
+        std::vector<uint8_t> payload = make_payload(sz);
         for (size_t i = 0; i < count; i++) {
-            if (!emit_report(cli, payload)) {
+            if (!emit_report(payload)) {
                 std::cerr << "[advance] report " << i << " rejected\n";
                 return "reject";
             }
@@ -727,13 +754,12 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string ntxt     = input.contains("noticeText")
             ? input.get("noticeText").get<std::string>()
             : std::string("MIXED_OK");
-        emit_notice(cli, bytes_to_hex(std::vector<uint8_t>(ntxt.begin(), ntxt.end())));
+        emit_notice(str_bytes(ntxt));
         std::string rtxt = input.contains("reportText")
             ? input.get("reportText").get<std::string>()
             : std::string("mixed_report");
-        emit_report(cli, bytes_to_hex(std::vector<uint8_t>(rtxt.begin(), rtxt.end())));
-        auto calldata = build_erc20_transfer(receiver, amount);
-        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
+        emit_report(str_bytes(rtxt));
+        (void)emit_voucher(token, build_erc20_transfer(receiver, amount));
         std::cout << "[advance] mixed_outputs notice+report+voucher\n";
         return "accept";
     }
@@ -744,8 +770,8 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string receiver  = input.get("receiver").get<std::string>();
         std::string amount_a  = input.get("amountFirst").get<std::string>();
         std::string amount_b  = input.get("amountSecond").get<std::string>();
-        (void)emit_voucher(cli, token, bytes_to_hex(build_erc20_transfer(receiver, amount_a)));
-        (void)emit_voucher(cli, token, bytes_to_hex(build_erc20_transfer(receiver, amount_b)));
+        (void)emit_voucher(token, build_erc20_transfer(receiver, amount_a));
+        (void)emit_voucher(token, build_erc20_transfer(receiver, amount_b));
         std::cout << "[advance] multi_erc20_withdraw two vouchers\n";
         return "accept";
     }
@@ -758,29 +784,24 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
             std::cerr << "[advance] large_voucher payload too large\n";
             return "reject";
         }
-        std::string payload = make_payload(sz);
-        if (!emit_voucher(cli, dest, payload)) return "reject";
+        if (!emit_voucher(dest, make_payload(sz))) return "reject";
         std::cout << "[advance] large_voucher bytes=" << sz << std::endl;
         return "accept";
     }
 
     // eth_withdraw ───────────────────────────────────────────────────────────
-    // v2: destination=receiver, payload=0x (empty), value=amount as 64-char hex
+    // v2: destination=receiver, payload=0x (empty), value=amount
     if (cmd == "eth_withdraw") {
         std::string receiver = input.get("receiver").get<std::string>();
         std::string amount   = input.get("amount").get<std::string>();
-        // Strip 0x prefix and left-pad to 64 hex chars (32 bytes)
-        std::string amt_hex = amount;
-        if (amt_hex.size() >= 2 && amt_hex[0] == '0' && (amt_hex[1] == 'x' || amt_hex[1] == 'X'))
-            amt_hex = amt_hex.substr(2);
-        while (amt_hex.size() < 64) amt_hex = "0" + amt_hex;
-        (void)emit_voucher(cli, receiver, "0x", amt_hex);
+        (void)emit_voucher(receiver, std::vector<uint8_t>(), amount);
         std::cout << "[advance] voucher: eth_withdraw to=" << receiver
-                  << " value=" << amt_hex << std::endl;
+                  << " value=" << amount << std::endl;
         return "accept";
     }
 
-    // erc20_withdraw — optional valueField: "omit" (default) vs "zero_hash" (32-byte zero value)
+    // erc20_withdraw — optional valueField: "omit" (default) vs "zero_hash" (32-byte zero value).
+    // Both encode value 0 in the Voucher output.
     if (cmd == "erc20_withdraw") {
         std::string token    = input.get("token").get<std::string>();
         std::string receiver = input.get("receiver").get<std::string>();
@@ -789,10 +810,9 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string vf = "omit";
         if (input.contains("valueField")) vf = input.get("valueField").get<std::string>();
         if (vf == "zero_hash") {
-            (void)emit_voucher(cli, token, bytes_to_hex(calldata),
-                          std::string(64, '0')); // 32-byte zero value for token-style vouchers
+            (void)emit_voucher(token, calldata, "0x" + std::string(64, '0'));
         } else {
-            (void)emit_voucher(cli, token, bytes_to_hex(calldata));
+            (void)emit_voucher(token, calldata);
         }
         std::cout << "[advance] voucher: erc20_withdraw token=" << token
                   << " to=" << receiver << " valueField=" << vf << std::endl;
@@ -806,7 +826,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string receiver = input.get("receiver").get<std::string>();
         std::string amount   = input.get("amount").get<std::string>();
         auto calldata = build_delegate_erc20_transfer(token, receiver, amount);
-        emit_delegate_voucher(cli, logic, bytes_to_hex(calldata));
+        (void)emit_delegate_voucher(logic, calldata);
         std::cout << "[advance] delegate-call-voucher: transferERC20 logic=" << logic
                   << " token=" << token << " to=" << receiver << std::endl;
         return "accept";
@@ -820,7 +840,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string amount   = input.get("amount").get<std::string>();
         std::string allowed  = input.get("allowedExecutor").get<std::string>();
         auto calldata = build_delegate_erc20_targeted(token, receiver, amount, allowed);
-        emit_delegate_voucher(cli, logic, bytes_to_hex(calldata));
+        (void)emit_delegate_voucher(logic, calldata);
         std::cout << "[advance] delegate-call-voucher: transferERC20Targeted logic=" << logic
                   << " allowedExecutor=" << allowed << std::endl;
         return "accept";
@@ -836,7 +856,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string receiver = input.get("receiver").get<std::string>();
         std::string token_id = input.get("tokenId").get<std::string>();
         auto calldata = build_erc721_safe_transfer(g_app_address, receiver, token_id);
-        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
+        (void)emit_voucher(token, calldata);
         std::cout << "[advance] voucher: erc721_withdraw to=" << receiver
                   << " tokenId=" << token_id << std::endl;
         return "accept";
@@ -850,7 +870,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string id       = input.get("id").get<std::string>();
         std::string amount   = input.get("amount").get<std::string>();
         auto calldata = build_erc1155_safe_transfer(g_app_address, receiver, id, amount);
-        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
+        (void)emit_voucher(token, calldata);
         std::cout << "[advance] voucher: erc1155_withdraw_single to=" << receiver << std::endl;
         return "accept";
     }
@@ -866,7 +886,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         for (auto &v : ids_arr)     ids.push_back(v.get<std::string>());
         for (auto &v : amounts_arr) amounts.push_back(v.get<std::string>());
         auto calldata = build_erc1155_safe_batch(g_app_address, receiver, ids, amounts);
-        (void)emit_voucher(cli, token, bytes_to_hex(calldata));
+        (void)emit_voucher(token, calldata);
         std::cout << "[advance] voucher: erc1155_withdraw_batch ids=" << ids.size()
                   << " to=" << receiver << std::endl;
         return "accept";
@@ -881,7 +901,7 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
         std::string receiver = input.get("receiver").get<std::string>();
         std::string token_id = input.get("tokenId").get<std::string>();
         auto calldata = build_erc721_mint(receiver, token_id);
-        (void)emit_voucher(cli, g_mint_contract, bytes_to_hex(calldata));
+        (void)emit_voucher(g_mint_contract, calldata);
         std::cout << "[advance] voucher: mint_erc721 to=" << receiver
                   << " tokenId=" << token_id << std::endl;
         return "accept";
@@ -894,50 +914,44 @@ static std::string handle_advance(httplib::Client &cli, picojson::value data) {
 // =============================================================================
 // INSPECT HANDLER
 // =============================================================================
-static std::string handle_inspect(httplib::Client &cli, picojson::value data) {
-    if (!data.contains("payload")) {
-        std::cerr << "[inspect] missing 'payload' field\n";
-        return "reject";
-    }
-    
-    std::string payload_hex = data.get("payload").get<std::string>();
-    std::string json_str    = hex_payload_to_string(payload_hex);
-    std::cout << "[inspect] raw payload: " << json_str << std::endl;
+static std::string handle_inspect(const cmt_rollup_inspect_t &ins) {
+    const uint8_t *pl = (const uint8_t *)ins.payload.data;
+    std::vector<uint8_t> payload(pl, pl + ins.payload.length);
+    std::string json_str(payload.begin(), payload.end());
+    std::cout << "[inspect] raw payload: " << json_str.substr(0, 256) << std::endl;
 
-    // Cartesi v2: the inspect REST endpoint wraps the client body in an outer
-    // {"payload":"0x..."} before passing it to the dapp.  Unwrap it so the
-    // dapp sees the actual JSON command the client sent.
+    // Clients may wrap the JSON command in {"payload":"0x<hex>"}; unwrap it so
+    // the dapp sees the actual JSON command the client sent.
     {
         picojson::value outer;
         std::string outer_err = picojson::parse(outer, json_str);
         if (outer_err.empty() && outer.is<picojson::object>() &&
-            outer.contains("payload") && !outer.contains("cmd")) {
-            std::string inner_hex = outer.get("payload").get<std::string>();
-            payload_hex = inner_hex;
-            json_str    = hex_payload_to_string(inner_hex);
-            std::cout << "[inspect] unwrapped v2 envelope, inner payload: " << json_str << std::endl;
+            outer.contains("payload") && !outer.contains("cmd") &&
+            outer.get("payload").is<std::string>()) {
+            payload  = hex_to_bytes(outer.get("payload").get<std::string>());
+            json_str = std::string(payload.begin(), payload.end());
+            std::cout << "[inspect] unwrapped envelope, inner payload: " << json_str.substr(0, 256) << std::endl;
         }
     }
-    std::cout << "[inspect] decoded payload: " << json_str << std::endl;
 
     picojson::value input;
     std::string parse_err = picojson::parse(input, json_str);
     if (!parse_err.empty()) {
         std::cerr << "[inspect] parse error: " << parse_err << std::endl;
         std::cout << "[inspect] echoing payload due to parse error\n";
-        emit_report(cli, payload_hex);
+        emit_report(payload);
         return "accept";
     }
     if (!input.is<picojson::object>()) {
         std::cerr << "[inspect] input is not an object\n";
         std::cout << "[inspect] echoing payload (not object)\n";
-        emit_report(cli, payload_hex);
+        emit_report(payload);
         return "accept";
     }
 
     if (!input.contains("cmd")) {
         std::cerr << "[inspect] missing 'cmd' field\n";
-        emit_report(cli, payload_hex);
+        emit_report(payload);
         return "accept";
     }
 
@@ -952,17 +966,14 @@ static std::string handle_inspect(httplib::Client &cli, picojson::value data) {
         }
         size_t sz    = (size_t)input.get("size").get<double>();
         size_t count = (size_t)input.get("count").get<double>();
-        std::string payload = make_payload(sz);
-        std::cout << "[inspect] generated payload of " << payload.length() << " bytes (hex)\n";
+        std::vector<uint8_t> rp = make_payload(sz);
         std::cout << "[inspect] generating " << count
                   << " reports of " << sz << " bytes each" << std::endl;
         for (size_t i = 0; i < count; i++) {
-            std::cout << "[inspect] emitting report " << i << "...\n";
-            if (!emit_report(cli, payload)) {
+            if (!emit_report(rp)) {
                 std::cerr << "[inspect] report " << i << " rejected (too large?)\n";
                 return "accept"; // inspect always returns accept, but no more reports
             }
-            std::cout << "[inspect] report " << i << " emitted successfully\n";
         }
         std::cout << "[inspect] done emitting " << count << " reports\n";
         return "accept";
@@ -970,68 +981,58 @@ static std::string handle_inspect(httplib::Client &cli, picojson::value data) {
 
     // echo ───────────────────────────────────────────────────────────────────
     if (cmd == "echo") {
-        emit_report(cli, payload_hex);
+        emit_report(payload);
         return "accept";
     }
 
-    std::string err = "unknown inspect cmd: " + cmd;
-    emit_report(cli, bytes_to_hex(std::vector<uint8_t>(err.begin(), err.end())));
+    emit_report(str_bytes("unknown inspect cmd: " + cmd));
     return "accept";
 }
 
 // =============================================================================
 // MAIN
 // =============================================================================
-int main(int argc, char **argv) {
-    const char *rollup_url = getenv("ROLLUP_HTTP_SERVER_URL");
-    if (!rollup_url) {
-        std::cerr << "[main] ROLLUP_HTTP_SERVER_URL not set\n";
+int main() {
+    int rc = cmt_rollup_init(&g_rollup);
+    if (rc) {
+        std::cerr << "[main] cmt_rollup_init failed rc=" << rc << " (" << strerror(-rc) << ")\n";
         return 1;
     }
 
-    httplib::Client cli(rollup_url);
-    cli.set_read_timeout(60, 0); // generous for large payloads
-    cli.set_write_timeout(60, 0); // allow time to send large reports
-    cli.set_connection_timeout(30, 0); // connection timeout
-
-    std::map<std::string,
-             std::string(*)(httplib::Client &, picojson::value)> handlers = {
-        {"advance_state", &handle_advance},
-        {"inspect_state", &handle_inspect},
-    };
-
+    cmt_rollup_finish_t finish;
+    memset(&finish, 0, sizeof(finish));
     std::string status = "accept";
-    while (true) {
-        std::cout << "[main] /finish status=" << status << std::endl;
-        std::string body = "{\"status\":\"" + status + "\"}";
-        auto r = cli.Post("/finish", body, "application/json");
-        if (!r) {
-            std::cerr << "[main] connection error on /finish, retrying...\n";
-            continue;
+    for (;;) {
+        std::cout << "[main] finish status=" << status << std::endl;
+        finish.accept_previous_request = (status == "accept");
+        rc = cmt_rollup_finish(&g_rollup, &finish);
+        if (rc) {
+            std::cerr << "[main] cmt_rollup_finish failed rc=" << rc << " (" << strerror(-rc) << ")\n";
+            return 1;
         }
-        if (r->status == 202) {
-            std::cout << "[main] no pending request\n";
-            continue;
-        }
-
-        picojson::value req;
-        std::string err = picojson::parse(req, r->body);
-        if (!err.empty()) {
-            std::cerr << "[main] failed to parse rollup request: " << err << "\n";
-            status = "reject";
-            continue;
-        }
-
-        std::string request_type = req.get("request_type").get<std::string>();
-        auto it = handlers.find(request_type);
-        if (it == handlers.end()) {
-            std::cerr << "[main] unknown request_type: " << request_type << "\n";
-            status = "reject";
-            continue;
-        }
-
         try {
-            status = it->second(cli, req.get("data"));
+            if (finish.next_request_type == HTIF_YIELD_REASON_ADVANCE_STATE) {
+                cmt_rollup_advance_t adv;
+                rc = cmt_rollup_read_advance_state(&g_rollup, &adv);
+                if (rc) {
+                    std::cerr << "[main] cannot read advance state rc=" << rc << "\n";
+                    status = "reject";
+                    continue;
+                }
+                status = handle_advance(adv);
+            } else if (finish.next_request_type == HTIF_YIELD_REASON_INSPECT_STATE) {
+                cmt_rollup_inspect_t ins;
+                rc = cmt_rollup_read_inspect_state(&g_rollup, &ins);
+                if (rc) {
+                    std::cerr << "[main] cannot read inspect state rc=" << rc << "\n";
+                    status = "reject";
+                    continue;
+                }
+                status = handle_inspect(ins);
+            } else {
+                std::cerr << "[main] unknown request type " << finish.next_request_type << "\n";
+                status = "reject";
+            }
         } catch (const std::exception &e) {
             std::cerr << "[main] exception: " << e.what() << "\n";
             status = "reject";
