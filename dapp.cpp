@@ -22,6 +22,21 @@
 //   {"cmd":"multi_erc20_withdraw","token":"0x...","receiver":"0x...","amountFirst":"0x...","amountSecond":"0x..."}
 //   {"cmd":"large_voucher","destination":"0x...","payloadBytes":<n>}
 //   erc20_withdraw optional: "valueField":"omit"|"zero_hash"
+//   force_exception optional: "hex":"0x..." (raw exception payload instead of message)
+//
+// QA commands (advance):
+//   {"cmd":"emit_blob","size":<bytes>[,"prefix":"0x.."][,"count":<n>]}   raw output(s), pattern i & 0xff
+//   {"cmd":"emit_blob","hex":"0x..."[,"count":<n>]}                      raw output(s) with exactly these bytes
+//   {"cmd":"emit_reports","count":<n>[,"size":<bytes>=16]}
+//   {"cmd":"emit_notices","count":<n>[,"size":<bytes>=16]}
+//   {"cmd":"emit_notice_exact","size":<bytes>}   one notice with exactly <bytes> of payload + a report
+//   {"cmd":"voucher","destination":"0x..","payload":"0x..",["value":"0x.."]}
+//   {"cmd":"delegate_voucher","destination":"0x..","payload":"0x.."}
+//   {"cmd":"reject"} | {"cmd":"halt"} | {"cmd":"unexpected_yield"}
+//   {"cmd":"invalid_outputs_root"} | {"cmd":"invalid_outputs_root_length"}
+//   {"cmd":"seq","steps":[{...},{...}]}          run commands in order, stop at the first non-accept
+// A QA command that cannot emit its output emits a report with the reason
+// (e.g. "rc=-105 (No buffer space available)") and rejects the input.
 //
 // Deposits are auto-detected by msg_sender matching portal addresses.
 // Notices append decoded layer payloads when non-empty: ETH/ERC20 " exec=0x…";
@@ -31,6 +46,10 @@
 // {"payload":"0x<hex of the JSON>"}):
 //   {"cmd":"generate_reports","size":<bytes>,"count":<n>}
 //   {"cmd":"echo"}  → reports back the raw payload as a report
+//   {"cmd":"emit_reports","count":<n>[,"size":<bytes>=16]}
+//   {"cmd":"reject"} → Rejected | {"cmd":"force_exception",...} → Exception
+//   {"cmd":"halt"} → MachineHalted | {"cmd":"unexpected_yield"} → Failed
+//   {"cmd":"seq","steps":[...]}
 //
 // =============================================================================
 
@@ -41,6 +60,7 @@
 #include <map>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
@@ -589,8 +609,139 @@ static std::vector<uint8_t> make_payload(size_t size_bytes) {
 }
 
 // =============================================================================
+// QA HELPERS (raw outputs, forged yields, argument parsing)
+// =============================================================================
+
+// Largest size the generators accept. Anything above can never fit the 2 MiB
+// CMIO buffer; the cap only keeps a typo from exhausting guest RAM.
+static const size_t MAX_GENERATED_SIZE = 32u << 20;
+
+static size_t size_arg(const picojson::value &in, const char *key, double dflt) {
+    double v = in.contains(key) ? in.get(key).get<double>() : dflt;
+    if (v < 0 || v > (double)MAX_GENERATED_SIZE)
+        throw std::runtime_error(std::string(key) + " out of range");
+    return (size_t)v;
+}
+
+static std::string str_arg(const picojson::value &in, const char *key, const std::string &dflt) {
+    return in.contains(key) ? in.get(key).get<std::string>() : dflt;
+}
+
+// Strict hex decoding ("0x" optional, even length, hex digits only).
+static bool parse_hex_strict(const std::string &hex, std::vector<uint8_t> &out) {
+    std::string h = hex;
+    if (h.size() >= 2 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h = h.substr(2);
+    if (h.size() % 2 != 0) return false;
+    for (char c : h)
+        if (!isxdigit((unsigned char)c)) return false;
+    out = hex_to_bytes(h);
+    return true;
+}
+
+// Report that explains why a QA command failed (reports survive a rejected
+// input), then reject.
+static std::string fail(const std::string &what) {
+    std::string msg = what;
+    if (g_last_rc) msg += " rc=" + std::to_string(g_last_rc) + " (" + strerror(-g_last_rc) + ")";
+    std::cerr << "[qa] " << msg << std::endl;
+    emit_report(str_bytes(msg));
+    return "reject";
+}
+
+// Raw output ("blob"): exactly these bytes, not ABI-wrapped, become one output
+// (an outputs-merkle-tree leaf). Same yield and merkle bookkeeping as
+// cmt_rollup_emit_notice, minus the Notice encoding.
+static bool emit_blob(const std::vector<uint8_t> &data) {
+    cmt_buf_t tx = cmt_io_get_tx(g_rollup.io);
+    if (data.size() > cmt_buf_length(&tx)) return check_rc("blob", -ENOBUFS);
+    if (!data.empty()) memcpy(tx.begin, data.data(), data.size());
+    struct cmt_io_yield req;
+    req.dev = HTIF_DEVICE_YIELD;
+    req.cmd = HTIF_YIELD_CMD_AUTOMATIC;
+    req.reason = HTIF_YIELD_AUTOMATIC_REASON_TX_OUTPUT;
+    req.data = (uint32_t)data.size();
+    int rc = cmt_io_yield(g_rollup.io, &req);
+    if (rc) return check_rc("blob", rc);
+    return check_rc("blob", cmt_merkle_push_back_data(g_rollup.merkle, data.size(), tx.begin));
+}
+
+// A request delivered by a hand-made "accepted" yield (see yield_forged_root);
+// main() processes it instead of calling cmt_rollup_finish.
+static bool g_pending_request = false;
+static int g_pending_request_type = 0;
+
+// Finish the current advance as accepted but declare `len` bytes of 0x5a as
+// the outputs merkle root instead of the real one. len 32: the node accepts
+// the input and marks the app INVALID_OUTPUTS_ROOT when the epoch closes;
+// len != 32: the input itself fails as INVALID_OUTPUTS_ROOT.
+static std::string yield_forged_root(uint32_t len) {
+    cmt_buf_t tx = cmt_io_get_tx(g_rollup.io);
+    memset(tx.begin, 0x5a, len);
+    struct cmt_io_yield req;
+    req.dev = HTIF_DEVICE_YIELD;
+    req.cmd = HTIF_YIELD_CMD_MANUAL;
+    req.reason = HTIF_YIELD_MANUAL_REASON_RX_ACCEPTED;
+    req.data = len;
+    std::cout << "[qa] accepted yield with a forged " << len << "-byte outputs root" << std::endl;
+    int rc = cmt_io_yield(g_rollup.io, &req);
+    if (rc) {
+        std::cerr << "[qa] forged-root yield failed rc=" << rc << "\n";
+        return "halt";
+    }
+    // Same bookkeeping as cmt_rollup_finish after an accepted yield.
+    g_rollup.fromhost_data = req.data;
+    g_pending_request = true;
+    g_pending_request_type = req.reason;
+    return "pending";
+}
+
+// Manual yield with a reason the node does not know (UNEXPECTED_YIELD).
+static std::string yield_unexpected() {
+    struct cmt_io_yield req;
+    req.dev = HTIF_DEVICE_YIELD;
+    req.cmd = HTIF_YIELD_CMD_MANUAL;
+    req.reason = 9;
+    req.data = 23;
+    std::cout << "[qa] manual yield with unexpected reason 9" << std::endl;
+    (void)cmt_io_yield(g_rollup.io, &req);
+    return "halt"; // never resumed by the node; exit if it ever is
+}
+
+// force_exception payload: "hex" (raw bytes) wins over "message" (text).
+static bool exception_payload(const picojson::value &in, std::vector<uint8_t> &out) {
+    if (in.contains("hex")) return parse_hex_strict(in.get("hex").get<std::string>(), out);
+    out = str_bytes(str_arg(in, "message", "test_exception"));
+    return true;
+}
+
+// emit_blob bytes: "hex" (exact bytes) or "size" bytes of pattern i & 0xff
+// with an optional "prefix" written over the first bytes.
+static bool blob_bytes(const picojson::value &in, std::vector<uint8_t> &out, std::string &err) {
+    if (in.contains("hex")) {
+        if (!parse_hex_strict(in.get("hex").get<std::string>(), out)) { err = "invalid hex"; return false; }
+        return true;
+    }
+    out = make_payload(size_arg(in, "size", 0));
+    if (in.contains("prefix")) {
+        std::vector<uint8_t> p;
+        if (!parse_hex_strict(in.get("prefix").get<std::string>(), p)) { err = "invalid prefix"; return false; }
+        if (p.size() > out.size()) { err = "prefix longer than size"; return false; }
+        std::copy(p.begin(), p.end(), out.begin());
+    }
+    return true;
+}
+
+static const int MAX_SEQ_DEPTH = 4;
+
+// =============================================================================
 // ADVANCE HANDLER
 // =============================================================================
+// Handlers return the request outcome: "accept", "reject", "exception" (an
+// exception yield was issued), "halt" (exit the process: the machine halts) or
+// "pending" (a forged accepted yield already fetched the next request).
+static std::string run_advance(const picojson::value &input, int depth);
+static std::string run_inspect(const picojson::value &input, const std::vector<uint8_t> &payload, int depth);
+
 static std::string handle_advance(const cmt_rollup_advance_t &adv) {
     std::string msg_sender = to_lower(bytes_to_hex(std::vector<uint8_t>(
         adv.msg_sender.data, adv.msg_sender.data + CMT_ABI_ADDRESS_LENGTH)));
@@ -694,6 +845,10 @@ static std::string handle_advance(const cmt_rollup_advance_t &adv) {
         return "reject";
     }
 
+    return run_advance(input, 0);
+}
+
+static std::string run_advance(const picojson::value &input, int depth) {
     std::string cmd = input.get("cmd").get<std::string>();
     std::cout << "[advance] cmd=" << cmd << std::endl;
 
@@ -721,15 +876,14 @@ static std::string handle_advance(const cmt_rollup_advance_t &adv) {
         return "accept";
     }
 
-    // force_exception — exception yield; input completes as EXCEPTION
+    // force_exception — exception yield; input completes as EXCEPTION.
+    // Payload: "message" (text, default "test_exception") or "hex" (raw bytes).
     if (cmd == "force_exception") {
-        std::string msg = input.contains("message")
-            ? input.get("message").get<std::string>()
-            : std::string("test_exception");
-        std::vector<uint8_t> mb = str_bytes(msg);
+        std::vector<uint8_t> mb;
+        if (!exception_payload(input, mb)) return fail("force_exception: invalid hex");
         std::cout << "[advance] raising exception payload len=" << mb.size() << std::endl;
         if (!emit_exception(mb)) return "reject";
-        return "accept";
+        return "exception";
     }
 
     // advance_reports — emit reports during an advance (same limits as notices)
@@ -907,6 +1061,92 @@ static std::string handle_advance(const cmt_rollup_advance_t &adv) {
         return "accept";
     }
 
+    // ── QA commands ─────────────────────────────────────────────────────────
+
+    // emit_blob — raw output(s) of exact bytes ("hex") or "size" pattern bytes
+    if (cmd == "emit_blob") {
+        std::vector<uint8_t> blob;
+        std::string err;
+        size_t count = size_arg(input, "count", 1);
+        g_last_rc = 0;
+        if (!blob_bytes(input, blob, err)) return fail("emit_blob: " + err);
+        for (size_t i = 0; i < count; i++)
+            if (!emit_blob(blob))
+                return fail("emit_blob failed: size=" + std::to_string(blob.size()) + " i=" + std::to_string(i));
+        std::cout << "[advance] emit_blob " << count << " x " << blob.size() << " bytes" << std::endl;
+        return "accept";
+    }
+
+    // emit_reports / emit_notices — N outputs of "size" bytes (pattern i & 0xff)
+    if (cmd == "emit_reports" || cmd == "emit_notices") {
+        bool reports = cmd == "emit_reports";
+        size_t count = size_arg(input, "count", 1);
+        std::vector<uint8_t> p = make_payload(size_arg(input, "size", 16));
+        for (size_t i = 0; i < count; i++) {
+            bool ok = reports ? emit_report(p) : emit_notice(p);
+            if (!ok)
+                return fail(cmd + " failed: size=" + std::to_string(p.size()) + " i=" + std::to_string(i));
+        }
+        std::cout << "[advance] " << cmd << " " << count << " x " << p.size() << " bytes" << std::endl;
+        return "accept";
+    }
+
+    // emit_notice_exact — one notice whose payload is exactly "size" bytes,
+    // plus a report with the payload and encoded sizes (or why it failed)
+    if (cmd == "emit_notice_exact") {
+        size_t sz = size_arg(input, "size", 0);
+        size_t encoded = 4 + 32 + 32 + (sz + 31) / 32 * 32;
+        std::string info = "emit_notice_exact payload=" + std::to_string(sz) +
+                           " encoded=" + std::to_string(encoded);
+        if (!emit_notice(make_payload(sz))) return fail(info + " failed");
+        emit_report(str_bytes(info + " ok"));
+        return "accept";
+    }
+
+    // voucher / delegate_voucher — arbitrary destination and calldata
+    if (cmd == "voucher" || cmd == "delegate_voucher") {
+        std::string dest = input.get("destination").get<std::string>();
+        std::vector<uint8_t> payload;
+        g_last_rc = 0;
+        if (!parse_hex_strict(str_arg(input, "payload", "0x"), payload))
+            return fail(cmd + ": invalid payload hex");
+        bool ok = cmd == "voucher" ? emit_voucher(dest, payload, str_arg(input, "value", ""))
+                                   : emit_delegate_voucher(dest, payload);
+        if (!ok) return fail(cmd + " failed: destination=" + dest);
+        return "accept";
+    }
+
+    // reject — finish the input as REJECTED (outputs of this input are discarded,
+    // reports are kept)
+    if (cmd == "reject") {
+        std::cout << "[advance] rejecting on request" << std::endl;
+        return "reject";
+    }
+
+    // halt — the dapp process exits; the machine halts (MACHINE_HALTED, terminal)
+    if (cmd == "halt") {
+        std::cout << "[advance] halting on request" << std::endl;
+        return "halt";
+    }
+
+    // unexpected_yield / invalid_outputs_root / invalid_outputs_root_length —
+    // the other guest-caused terminal outcomes
+    if (cmd == "unexpected_yield") return yield_unexpected();
+    if (cmd == "invalid_outputs_root") return yield_forged_root(32);
+    if (cmd == "invalid_outputs_root_length") return yield_forged_root(31);
+
+    // seq — run "steps" (command objects) in order; stops at the first step that
+    // does not accept and returns its outcome
+    if (cmd == "seq") {
+        if (depth >= MAX_SEQ_DEPTH) throw std::runtime_error("seq nested too deep");
+        const picojson::array &steps = input.get("steps").get<picojson::array>();
+        for (size_t i = 0; i < steps.size(); i++) {
+            std::string st = run_advance(steps[i], depth + 1);
+            if (st != "accept") return st;
+        }
+        return "accept";
+    }
+
     std::cerr << "[advance] unknown cmd: " << cmd << std::endl;
     return "reject";
 }
@@ -955,6 +1195,10 @@ static std::string handle_inspect(const cmt_rollup_inspect_t &ins) {
         return "accept";
     }
 
+    return run_inspect(input, payload, 0);
+}
+
+static std::string run_inspect(const picojson::value &input, const std::vector<uint8_t> &payload, int depth) {
     std::string cmd = input.get("cmd").get<std::string>();
     std::cout << "[inspect] cmd=" << cmd << std::endl;
 
@@ -985,6 +1229,47 @@ static std::string handle_inspect(const cmt_rollup_inspect_t &ins) {
         return "accept";
     }
 
+    // emit_reports — N reports of "size" bytes (pattern i & 0xff)
+    if (cmd == "emit_reports") {
+        size_t count = size_arg(input, "count", 1);
+        std::vector<uint8_t> rp = make_payload(size_arg(input, "size", 16));
+        for (size_t i = 0; i < count; i++)
+            if (!emit_report(rp)) break; // inspect: no more reports, still accepted
+        return "accept";
+    }
+
+    // reject — inspect status "Rejected"
+    if (cmd == "reject") return "reject";
+
+    // force_exception — inspect status "Exception", exception_data = payload
+    if (cmd == "force_exception") {
+        std::vector<uint8_t> payload;
+        if (!exception_payload(input, payload)) {
+            emit_report(str_bytes("force_exception: invalid hex"));
+            return "accept";
+        }
+        emit_exception(payload);
+        return "exception";
+    }
+
+    // halt — the process exits during the inspect: status "MachineHalted"
+    // (only the inspect's temporary machine halts; the app stays OK)
+    if (cmd == "halt") return "halt";
+
+    // unexpected_yield — inspect status "Failed"
+    if (cmd == "unexpected_yield") return yield_unexpected();
+
+    // seq — same as on advance, with the inspect commands
+    if (cmd == "seq") {
+        if (depth >= MAX_SEQ_DEPTH) throw std::runtime_error("seq nested too deep");
+        const picojson::array &steps = input.get("steps").get<picojson::array>();
+        for (size_t i = 0; i < steps.size(); i++) {
+            std::string st = run_inspect(steps[i], payload, depth + 1);
+            if (st != "accept") return st;
+        }
+        return "accept";
+    }
+
     emit_report(str_bytes("unknown inspect cmd: " + cmd));
     return "accept";
 }
@@ -1003,12 +1288,22 @@ int main() {
     memset(&finish, 0, sizeof(finish));
     std::string status = "accept";
     for (;;) {
-        std::cout << "[main] finish status=" << status << std::endl;
-        finish.accept_previous_request = (status == "accept");
-        rc = cmt_rollup_finish(&g_rollup, &finish);
-        if (rc) {
-            std::cerr << "[main] cmt_rollup_finish failed rc=" << rc << " (" << strerror(-rc) << ")\n";
-            return 1;
+        if (status == "halt") {
+            std::cout << "[main] exiting: the machine halts" << std::endl;
+            return 0;
+        }
+        if (status == "pending") {
+            // the next request was already fetched by a forged accepted yield
+            g_pending_request = false;
+            finish.next_request_type = g_pending_request_type;
+        } else {
+            std::cout << "[main] finish status=" << status << std::endl;
+            finish.accept_previous_request = (status == "accept" || status == "exception");
+            rc = cmt_rollup_finish(&g_rollup, &finish);
+            if (rc) {
+                std::cerr << "[main] cmt_rollup_finish failed rc=" << rc << " (" << strerror(-rc) << ")\n";
+                return 1;
+            }
         }
         try {
             if (finish.next_request_type == HTIF_YIELD_REASON_ADVANCE_STATE) {

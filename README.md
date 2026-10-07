@@ -315,6 +315,76 @@ Emit a voucher calling `MintableERC721.mint(receiver, tokenId)`. Requires `set_m
 
 ---
 
+### QA commands (advance)
+
+Commands for node validation: raw outputs, bulk outputs, the 2 MiB output boundary and every guest-caused request outcome. Same encoding as above (JSON bytes sent through the InputBox). When a QA command cannot emit an output it emits a **report** with the reason (for example `emit_blob failed: size=2097153 i=0 rc=-105 (No buffer space available)`) and **rejects** the input; reports of a rejected input are kept by the node, its outputs are not.
+
+Byte patterns: `size` bytes are `i & 0xff` (`00 01 02 … ff 00 01 …`), the same pattern as `generate_notices`.
+
+#### `emit_blob`
+One raw output (not ABI-wrapped: no Notice/Voucher selector is added) per `count` (default 1). The node stores it as an output and proves it like any other output; it has no `decoded_data` and cannot be executed on L1. Either `size` bytes of the pattern, optionally overwritten at the start by `prefix`, or exactly `hex`. The whole output must fit the 2 MiB buffer: `size` 2097152 is accepted, 2097153 is rejected.
+```json
+{"cmd":"emit_blob","size":2097152}
+{"cmd":"emit_blob","hex":"0xdeadbeef00112233"}
+{"cmd":"emit_blob","size":68,"prefix":"0xc258d6e5000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"}
+```
+The last example builds an output whose bytes 17..36 equal an address but which is not a voucher (for `voucher_address` filter tests).
+
+#### `emit_reports` / `emit_notices`
+`count` reports or notices (default 1) of `size` bytes each (default 16). Also accepted on inspect (`emit_reports`). The node caps reports per input at 65536 (beyond that the app goes `FAILED`).
+```json
+{"cmd":"emit_reports","count":20000,"size":16}
+{"cmd":"emit_notices","count":20000}
+```
+
+#### `emit_notice_exact`
+One notice whose payload is exactly `size` bytes, plus a report `emit_notice_exact payload=<size> encoded=<bytes> ok` (or `... failed rc=-105 ...` and the input is rejected). `encoded` = 4 + 32 + 32 + payload padded to 32 bytes, so the boundary is payload **2097056** (encoded 2097124, accepted) vs **2097057** (encoded 2097156, rejected). A 2 MiB payload is rejected; use `emit_blob` with `size` 2097152 for an output of exactly 2 MiB.
+```json
+{"cmd":"emit_notice_exact","size":2097056}
+```
+
+#### `voucher` / `delegate_voucher`
+A voucher (`value` optional, default 0) or a DELEGATECALL voucher with any destination and calldata (hex, `0x` for empty).
+```json
+{"cmd":"voucher","destination":"0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81","payload":"0xa9059cbb","value":"0x0"}
+{"cmd":"delegate_voucher","destination":"0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81","payload":"0xdeadbeef"}
+```
+
+#### `reject`
+Finish the input as **`REJECTED`**: outputs emitted earlier in the same input are discarded, reports are kept, the app stays `OK`.
+```json
+{"cmd":"reject"}
+```
+
+#### `force_exception` (raw payload)
+Besides `message`, `hex` sets the raw exception payload (the input's `exception_data`). Terminal: the app becomes `GUEST_EXCEPTION`.
+```json
+{"cmd":"force_exception","hex":"0xdeadbeef0102"}
+```
+
+#### `halt`
+The dapp process exits, so the machine halts while processing the input: input and app **`MACHINE_HALTED`** (terminal; use a throwaway app).
+```json
+{"cmd":"halt"}
+```
+
+#### `unexpected_yield` / `invalid_outputs_root` / `invalid_outputs_root_length`
+The other guest-caused terminal outcomes (throwaway apps only):
+- `unexpected_yield`: a manual yield with a reason the node does not know -> `UNEXPECTED_YIELD`.
+- `invalid_outputs_root`: the input is finished as accepted but declares 32 bytes of `0x5a` as outputs root. The input is `ACCEPTED`; the app becomes `INVALID_OUTPUTS_ROOT` when its epoch closes and the node finds the declared root differs from the one computed from the stored outputs.
+- `invalid_outputs_root_length`: accepted yield declaring a 31-byte root -> the input fails and the app is `INVALID_OUTPUTS_ROOT` at once.
+```json
+{"cmd":"unexpected_yield"}
+```
+
+#### `seq`
+Run several JSON advance commands in one input, in order (nesting up to 4 levels). Stops at the first step that does not accept and takes its outcome, so outputs/reports can be produced right before a reject, an exception or a halt.
+```json
+{"cmd":"seq","steps":[{"cmd":"emit_reports","count":3},{"cmd":"emit_notices","count":2,"size":8},{"cmd":"halt"}]}
+```
+
+---
+
 ### Inspect inputs
 
 #### `generate_reports`
@@ -328,6 +398,23 @@ Return the raw payload as a single report — useful for verifying encoding roun
 ```json
 {"cmd":"echo"}
 ```
+
+#### `emit_reports`
+`count` reports of `size` bytes (defaults 1 and 16), as on advance.
+```json
+{"cmd":"emit_reports","count":3,"size":16}
+```
+
+#### `reject` / `force_exception` / `halt` / `unexpected_yield` / `seq`
+Request outcomes during an inspect. Inspect runs on a temporary copy of the machine, so none of them changes the application status:
+
+| Payload | Inspect response `status` |
+|---|---|
+| `{"cmd":"reject"}` | `Rejected` |
+| `{"cmd":"force_exception","hex":"0xdeadbeef0102"}` | `Exception`, `exception_data` = `0xdeadbeef0102` |
+| `{"cmd":"halt"}` | `MachineHalted` |
+| `{"cmd":"unexpected_yield"}` | `Failed` |
+| `{"cmd":"seq","steps":[{"cmd":"emit_reports","count":2},{"cmd":"reject"}]}` | `Rejected` with the 2 reports |
 
 ---
 
@@ -420,6 +507,7 @@ curl -s http://localhost:6751/anvil -X POST -H "Content-Type: application/json" 
 | Notice | `Notice(bytes)`: 4 + 32 + 32 + payload padded to 32 | 2,097,056 bytes |
 | Voucher calldata | `Voucher(address,uint256,bytes)`: 4 + 4*32 + payload padded to 32 | 2,096,992 bytes |
 | Report | raw bytes | 2,097,152 bytes |
+| Raw output (`emit_blob`) | raw bytes | 2,097,152 bytes |
 
 The limit is on the **encoded** output: the whole output must fit the 2,097,152-byte CMIO transmit buffer. A notice/voucher adds its ABI header and 32-byte padding, so the largest notice payload is **2,097,056** bytes (`68 + 32*ceil(n/32) <= 2097152`); a payload of exactly 2 MiB is rejected. Reports are written raw (no header), so a 2,097,152-byte report fits.
 
