@@ -1,4 +1,5 @@
 .cartesi
+.build
 dapp
 .DS_Store
 tests/.env

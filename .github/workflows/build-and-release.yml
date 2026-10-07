@@ -1,98 +1,109 @@
 name: build-and-release
 
+# Builds the machine snapshot with scripts/build-snapshot.sh (pinned toolchain,
+# see scripts/build.env) on every PR and tag. On a version tag (v*) it publishes
+# a GitHub release with the snapshot, its sha256, the template hash and the
+# toolchain versions.
+
 on:
   push:
     tags:
-      - "*"
+      - "v*"
   pull_request:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      attestations: write
-      id-token: write
-
-    env:
-      REGISTRY: ghcr.io
-
+    name: build snapshot
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
+      - name: Set up QEMU (riscv64)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      # Same BuildKit version as the reference local builds (Docker 27.5 / BuildKit v0.18.2)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: current
+          driver-opts: image=moby/buildkit:v0.18.2
 
-      - name: Install Cartesi CLI
-        run: npm install -g @cartesi/cli@2.0.0-alpha.35
-
-      - name: Log in to GHCR
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: docker/login-action@v3
+      - name: Cache kernel and rootfs-tools
+        uses: actions/cache@v4
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          path: .build/images
+          key: machine-images-${{ hashFiles('scripts/dependencies.sha256') }}
 
-      - name: Build Docker image and Cartesi snapshot
-        run: cartesi build
+      - name: Build snapshot (cold, no BuildKit cache)
         env:
-          DOCKER_BUILDKIT: 1
-          BUILDKIT_INLINE_CACHE: 1
+          NO_CACHE: "1"
+        run: scripts/build-snapshot.sh
 
-      - name: Create compressed snapshot
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Summary
         run: |
-          tar -czf snapshot.tar.gz -C .cartesi/image .
-          sha256sum snapshot.tar.gz > snapshot.tar.gz.sha256
+          {
+            echo '### Tester snapshot'
+            echo
+            echo '```'
+            cat .build/build-info.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload snapshot artifacts
-        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: snapshot
+          if-no-files-found: error
           path: |
-            snapshot.tar.gz
-            snapshot.tar.gz.sha256
+            .build/snapshot.tar.gz
+            .build/snapshot.tar.gz.sha256
+            .build/template-hash.txt
+            .build/build-info.txt
 
   release:
     name: release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
-
     steps:
       - name: Download snapshot artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: snapshot
+          path: release-assets
 
-      - name: Prepare release assets
+      - name: Release notes
         run: |
-          mkdir -p release-assets
-          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
-          find artifacts -name "*.sha256" -exec cp {} release-assets/ \;
+          {
+            echo "Template hash: \`$(cat release-assets/template-hash.txt)\`"
+            echo
+            echo "Deploy with \`cartesi-rollups-cli deploy application <name> <dir>\` after"
+            echo "\`mkdir <dir> && tar -xzf snapshot.tar.gz -C <dir>\`."
+            echo
+            echo "Toolchain and checksums (build-info.txt):"
+            echo
+            echo '```'
+            cat release-assets/build-info.txt
+            echo '```'
+          } > release-notes.md
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
-          prerelease: ${{ contains(github.ref, '-rc') }}
+          body_path: release-notes.md
+          prerelease: ${{ contains(github.ref, '-') }}
           fail_on_unmatched_files: true
+          files: |
+            release-assets/snapshot.tar.gz
+            release-assets/snapshot.tar.gz.sha256
+            release-assets/template-hash.txt
+            release-assets/build-info.txt

@@ -38,17 +38,18 @@ const PRIVATE_KEY  = process.env.PRIVATE_KEY  || '0xac0974bec39a17e36ba4a6b4d238
 const OTHER_PRIVATE_KEY = process.env.OTHER_PRIVATE_KEY
   || '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
-// Contract addresses for Cartesi Rollups node v2.0.0-alpha.12 +
-// rollups-contracts v3.0.0-alpha.6. Override from .env when running against a
+// Contract addresses for Cartesi Rollups node v2.0.0-alpha.13 +
+// rollups-contracts v3.0.0-alpha.10 (same addresses on the devnet, Sepolia,
+// Base Sepolia and OP Sepolia). Override from .env when running against a
 // different address-book.
 const ADDR = {
   APP:                  () => e('CARTESI_APP_ADDRESS'),
-  INPUT_BOX:            process.env.INPUT_BOX_ADDRESS    || '0x346B3df038FE9f8380071eC6514D5a83aD143939',
-  ETH_PORTAL:           process.env.ETH_PORTAL_ADDRESS   || '0x8b53327575ac999bdfa8003f4b5134DFF9027516',
-  ERC20_PORTAL:         process.env.ERC20_PORTAL_ADDRESS || '0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1',
-  ERC721_PORTAL:        process.env.ERC721_PORTAL_ADDRESS|| '0xcA3a0a47915C12F020CF70B938aCC8e744414cb8',
-  ERC1155_SINGLE_PORTAL:process.env.ERC1155_SINGLE_PORTAL|| '0x13663E193673756a02e84b724B8a3422A9a7aab4',
-  ERC1155_BATCH_PORTAL: process.env.ERC1155_BATCH_PORTAL || '0x3649c5E2De91C69a7Bb80D864f0039da5E511096',
+  INPUT_BOX:            process.env.INPUT_BOX_ADDRESS    || '0xEbE9f4Dfc04ae10bBeE663859c3dc5A23f94eA3C',
+  ETH_PORTAL:           process.env.ETH_PORTAL_ADDRESS   || '0x035b11Be55656c6cfC822D1CaE568C1Af2e497b0',
+  ERC20_PORTAL:         process.env.ERC20_PORTAL_ADDRESS || '0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419',
+  ERC721_PORTAL:        process.env.ERC721_PORTAL_ADDRESS|| '0x397c352d18DFf47CC8a6143403142cf7afd5Ff7E',
+  ERC1155_SINGLE_PORTAL:process.env.ERC1155_SINGLE_PORTAL|| '0x585F56351A66f131E176a345662215C772f80451',
+  ERC1155_BATCH_PORTAL: process.env.ERC1155_BATCH_PORTAL || '0xee33550a22e3Cf6Cc265524dC9bcfD99D2307EBe',
   TEST_ERC20:           () => e('TEST_ERC20_ADDRESS'),
   TEST_ERC721:          () => e('TEST_ERC721_ADDRESS'),
   TEST_ERC1155:         () => e('TEST_ERC1155_ADDRESS'),

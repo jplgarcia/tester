@@ -1,7 +1,10 @@
 .cartesi
+.build
 dapp
 .DS_Store
 .git
 .github
+3rdparty/picojson
 contracts
+scripts
 tests

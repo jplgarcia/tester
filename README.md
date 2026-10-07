@@ -2,11 +2,7 @@
 
 A C++ Cartesi v2 dapp for exercising all rollup primitives: every deposit type, every withdrawal type (via vouchers), delegate-call vouchers, configurable notice/report generation, exception registration, mixed outputs per advance, and an ERC721 voucher-mint flow. Integration tests cover JSON-RPC pagination, ERC-20 `execLayerData` deposits (Rollups v2 `InputEncoding` packed payload), large vouchers, and multi-voucher L1 ordering.
 
-After changing **`dapp.cpp`**, rebuild the binary before `cartesi build`:
-
-```bash
-make    # repo root — produces ./dapp
-```
+The dapp talks to the machine through **libcmt** (the C library shipped in machine-guest-tools), not through `rollup-http-server`. Outputs are encoded straight into the 2 MiB CMIO transmit buffer, so there is no HTTP/JSON body limit in the way and very large requests cannot kill the dapp with `SIGPIPE`; an output that does not fit the buffer makes the emit call return `-ENOBUFS` (`-105`) and the dapp rejects the input. The machine entrypoint is the dapp binary itself (`/opt/cartesi/dapp/dapp`): if it exits, the machine halts.
 
 ---
 
@@ -23,20 +19,30 @@ make    # repo root — produces ./dapp
 
 ## Stack
 
-This repo is updated for Cartesi Rollups node `v2.0.0-alpha.12`, `rollups-contracts v3.0.0-alpha.6`, and `machine-guest-tools v0.17.2` (the machine tooling used by that node version).
+This repo targets Cartesi Rollups node `v2.0.0-alpha.13` with `rollups-contracts v3.0.0-alpha.10`:
 
-## Addresses (from `cartesi address-book`)
+| Component | Version | Pin |
+|---|---|---|
+| rollups-node | `v2.0.0-alpha.13` | commit `36155487d8bcb1daca5d683b8fa4ec65feba3ab7` |
+| rollups-contracts | `v3.0.0-alpha.10` | addresses below |
+| machine-guest-tools | `v0.18.0` | `machine-guest-tools_riscv64.deb` sha256 `204d4260defd68e11b957ae1f1b511b6c2c74345c918748be06f592733b72dcd` |
+| machine-emulator | `0.21.0` | the emulator used by node alpha.13; the snapshot must be built with it |
+| kernel | `linux-6.5.13-ctsi-2-v0.21.0.bin` | sha256 `5c900060da2db2bfa84cd39cd9cd722988c83c42225f3cac55f2d3157e48f32f` (node tag `test/dependencies.sha256`) |
 
-These are the local devnet addresses for the stack above:
+A snapshot built with another emulator version (for example the one pinned by `cartesi build` from CLI `2.0.0-alpha.35`, emulator 0.20.0) has a different template hash and is not loadable by node alpha.13.
+
+## Addresses
+
+rollups-contracts `v3.0.0-alpha.10` is deployed deterministically: the addresses are the same on the local devnet, Sepolia, Base Sepolia and OP Sepolia, so one snapshot serves every network. The portal addresses are compiled into `dapp.cpp` (deposits are recognised by `msg_sender`); a stack with other portal addresses needs a rebuild.
 
 | Contract | Address |
 |---|---|
-| InputBox | `0x346B3df038FE9f8380071eC6514D5a83aD143939` |
-| EtherPortal | `0x8b53327575ac999bdfa8003f4b5134DFF9027516` |
-| ERC20Portal | `0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1` |
-| ERC721Portal | `0xcA3a0a47915C12F020CF70B938aCC8e744414cb8` |
-| ERC1155SinglePortal | `0x13663E193673756a02e84b724B8a3422A9a7aab4` |
-| ERC1155BatchPortal | `0x3649c5E2De91C69a7Bb80D864f0039da5E511096` |
+| InputBox | `0xEbE9f4Dfc04ae10bBeE663859c3dc5A23f94eA3C` |
+| EtherPortal | `0x035b11Be55656c6cfC822D1CaE568C1Af2e497b0` |
+| ERC20Portal | `0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419` |
+| ERC721Portal | `0x397c352d18DFf47CC8a6143403142cf7afd5Ff7E` |
+| ERC1155SinglePortal | `0x585F56351A66f131E176a345662215C772f80451` |
+| ERC1155BatchPortal | `0xee33550a22e3Cf6Cc265524dC9bcfD99D2307EBe` |
 
 Run `cartesi address-book` after `cartesi run` starts and copy any changed values into `tests/.env`. Test token contracts can be provided by the devnet or deployed via `forge script Deploy`; their addresses vary per run.
 
@@ -51,9 +57,39 @@ private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
 ---
 
+## Building the snapshot
+
+Node alpha.13 needs a snapshot built with **cartesi-machine 0.21.0**. `cartesi build` from CLI `2.0.0-alpha.35` pins emulator 0.20.0, so the snapshot is built by a script that reproduces the CLI pipeline with the pinned toolchain (everything in `scripts/build.env`, the `Dockerfile` and `scripts/dependencies.sha256`):
+
+```bash
+make snapshot          # or: scripts/build-snapshot.sh
+make snapshot-clean    # cold build (no BuildKit cache), what CI and the reproducibility check use
+```
+
+Requirements: Docker with buildx and riscv64 emulation (Docker Desktop has it; on Linux `docker run --privileged --rm tonistiigi/binfmt --install riscv64`), `curl`, `git`. `IMAGES_DIR=<dir>` reuses an existing download of the kernel and rootfs-tools (they are always sha256-checked).
+
+| Step | Tool (pinned) | Output |
+|---|---|---|
+| kernel `linux-6.5.13-ctsi-2-v0.21.0.bin`, `rootfs-tools.ext2` (v0.18.0) | sha256 = node tag `test/dependencies.sha256` | `.build/images/` |
+| riscv64 root filesystem | `docker buildx` on `ubuntu:noble-20250910@sha256:…`, apt only from `snapshot.ubuntu.com` @ `20250915T030400Z`, guest tools .deb and picojson by sha256, file times = `SOURCE_DATE_EPOCH` | `.build/root.tar` |
+| ext2 | `xgenext2fs --block-size 4096 --faketime --readjustment +0` (from `cartesi/sdk:0.12.0-alpha.41@sha256:…`, as `cartesi build`) | `.build/root.ext2` |
+| machine | `cartesi/machine-emulator:0.21.0@sha256:…`: `cartesi-machine --ram-length=128Mi --flash-drive=label:root,data_filename:root.ext2 --env=PATH=… --workdir=/opt/cartesi/dapp --final-hash --store=snapshot -- /opt/cartesi/dapp/dapp`, stopped at the dapp's first accepted yield | `.build/snapshot/` |
+| release files | template hash = `cartesi-machine-stored-hash` (checked equal to `hash_tree.sht`@0x60, what the CLI reads); deterministic `tar` + `gzip -n` | `.build/template-hash.txt`, `snapshot.tar.gz`, `snapshot.tar.gz.sha256`, `build-info.txt` |
+
+Template hash of this source: `0xbbb07f2e3f0339ae5c8fcff025553fc3043a2f4cb0ebaa4f268cc4c9ccf65f96` (two cold builds from fresh clones gave the same template hash and byte-identical `root.tar`, `root.ext2` and `snapshot.tar.gz`, sha256 `c95b16495f73a31c915b433a214f6cd6eb99caa5b7beea014cfcf3f805704306`). It was deployed on a rollups-node v2.0.0-alpha.13 devnet (Authority): deposits of every portal, ETH and ERC-20 voucher execution, notice validation and every QA command behaved as documented below.
+
+Deploy on a node alpha.13 (any network, since the alpha.10 addresses are the same everywhere):
+
+```bash
+mkdir tester && tar -xzf snapshot.tar.gz -C tester
+cartesi-rollups-cli deploy application tester ./tester    # see the node docs for consensus/epoch options
+```
+
 ## Running
 
 ### 1 — Build and start the devnet
+
+> `cartesi build` / `cartesi run` from CLI `2.0.0-alpha.35` use their own emulator (0.20.0) and node: fine for iterating on the dapp locally, but the template hash differs from the alpha.13 snapshot. To test against node alpha.13, deploy the snapshot from `make snapshot` (or the release) with `cartesi-rollups-cli deploy application`.
 
 `cartesi run` in v2 proxies all services through a single port (default `6751`):
 
@@ -194,7 +230,7 @@ Emits a notice confirming the address.
 ---
 
 #### `generate_notices`
-Generate N notices of a given byte size. Sizes up to **2,097,152 bytes (2 MB)** are accepted. Larger sizes cause the advance to be **rejected**.
+Generate N notices of a given byte size (payload pattern `i & 0xff`). Payloads up to **2,097,056 bytes** fit the 2 MiB output buffer once ABI-encoded; larger sizes cause the advance to be **rejected**.
 ```json
 {"cmd":"generate_notices","size":1024,"count":3}
 ```
@@ -202,7 +238,7 @@ Generate N notices of a given byte size. Sizes up to **2,097,152 bytes (2 MB)** 
 ---
 
 #### `force_exception`
-Registers an **exception** for the current input (HTTP `POST` to the rollup **`/exception`** endpoint). The input finishes with status **`EXCEPTION`** (not `ACCEPTED`).
+Raises an **exception** for the current input (libcmt `cmt_rollup_emit_exception`, payload = `message`). The input finishes with status **`EXCEPTION`** (not `ACCEPTED`) and the application becomes `GUEST_EXCEPTION` (terminal), so use a throwaway app.
 ```json
 {"cmd":"force_exception","message":"optional reason"}
 ```
@@ -309,6 +345,76 @@ Emit a voucher calling `MintableERC721.mint(receiver, tokenId)`. Requires `set_m
 
 ---
 
+### QA commands (advance)
+
+Commands for node validation: raw outputs, bulk outputs, the 2 MiB output boundary and every guest-caused request outcome. Same encoding as above (JSON bytes sent through the InputBox). When a QA command cannot emit an output it emits a **report** with the reason (for example `emit_blob failed: size=2097153 i=0 rc=-105 (No buffer space available)`) and **rejects** the input; reports of a rejected input are kept by the node, its outputs are not.
+
+Byte patterns: `size` bytes are `i & 0xff` (`00 01 02 … ff 00 01 …`), the same pattern as `generate_notices`.
+
+#### `emit_blob`
+One raw output (not ABI-wrapped: no Notice/Voucher selector is added) per `count` (default 1). The node stores it as an output and proves it like any other output; it has no `decoded_data` and cannot be executed on L1. Either `size` bytes of the pattern, optionally overwritten at the start by `prefix`, or exactly `hex`. The whole output must fit the 2 MiB buffer: `size` 2097152 is accepted, 2097153 is rejected.
+```json
+{"cmd":"emit_blob","size":2097152}
+{"cmd":"emit_blob","hex":"0xdeadbeef00112233"}
+{"cmd":"emit_blob","size":68,"prefix":"0xc258d6e5000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"}
+```
+The last example builds an output whose bytes 17..36 equal an address but which is not a voucher (for `voucher_address` filter tests).
+
+#### `emit_reports` / `emit_notices`
+`count` reports or notices (default 1) of `size` bytes each (default 16). Also accepted on inspect (`emit_reports`). The node caps reports per input at 65536 (beyond that the app goes `FAILED`).
+```json
+{"cmd":"emit_reports","count":20000,"size":16}
+{"cmd":"emit_notices","count":20000}
+```
+
+#### `emit_notice_exact`
+One notice whose payload is exactly `size` bytes, plus a report `emit_notice_exact payload=<size> encoded=<bytes> ok` (or `... failed rc=-105 ...` and the input is rejected). `encoded` = 4 + 32 + 32 + payload padded to 32 bytes, so the boundary is payload **2097056** (encoded 2097124, accepted) vs **2097057** (encoded 2097156, rejected). A 2 MiB payload is rejected; use `emit_blob` with `size` 2097152 for an output of exactly 2 MiB.
+```json
+{"cmd":"emit_notice_exact","size":2097056}
+```
+
+#### `voucher` / `delegate_voucher`
+A voucher (`value` optional, default 0) or a DELEGATECALL voucher with any destination and calldata (hex, `0x` for empty).
+```json
+{"cmd":"voucher","destination":"0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81","payload":"0xa9059cbb","value":"0x0"}
+{"cmd":"delegate_voucher","destination":"0x7a051EDffC0884cd88d4a377F4C87BE074CF6c81","payload":"0xdeadbeef"}
+```
+
+#### `reject`
+Finish the input as **`REJECTED`**: outputs emitted earlier in the same input are discarded, reports are kept, the app stays `OK`.
+```json
+{"cmd":"reject"}
+```
+
+#### `force_exception` (raw payload)
+Besides `message`, `hex` sets the raw exception payload (the input's `exception_data`). Terminal: the app becomes `GUEST_EXCEPTION`.
+```json
+{"cmd":"force_exception","hex":"0xdeadbeef0102"}
+```
+
+#### `halt`
+The dapp process exits, so the machine halts while processing the input: input and app **`MACHINE_HALTED`** (terminal; use a throwaway app).
+```json
+{"cmd":"halt"}
+```
+
+#### `unexpected_yield` / `invalid_outputs_root` / `invalid_outputs_root_length`
+The other guest-caused terminal outcomes (throwaway apps only):
+- `unexpected_yield`: a manual yield with a reason the node does not know -> `UNEXPECTED_YIELD`.
+- `invalid_outputs_root`: the input is finished as accepted but declares 32 bytes of `0x5a` as outputs root. The input is `ACCEPTED`; when its epoch closes the node compares the root declared by the epoch's **last** input with the one computed from the stored outputs, so the app becomes `INVALID_OUTPUTS_ROOT` only if no later input of the same epoch was processed (the dapp keeps running and the next input declares the real root again). Use a short epoch, or send it last.
+- `invalid_outputs_root_length`: accepted yield declaring a 31-byte root -> the input fails and the app is `INVALID_OUTPUTS_ROOT` at once.
+```json
+{"cmd":"unexpected_yield"}
+```
+
+#### `seq`
+Run several JSON advance commands in one input, in order (nesting up to 4 levels). Stops at the first step that does not accept and takes its outcome, so outputs/reports can be produced right before a reject, an exception or a halt.
+```json
+{"cmd":"seq","steps":[{"cmd":"emit_reports","count":3},{"cmd":"emit_notices","count":2,"size":8},{"cmd":"halt"}]}
+```
+
+---
+
 ### Inspect inputs
 
 #### `generate_reports`
@@ -322,6 +428,23 @@ Return the raw payload as a single report — useful for verifying encoding roun
 ```json
 {"cmd":"echo"}
 ```
+
+#### `emit_reports`
+`count` reports of `size` bytes (defaults 1 and 16), as on advance.
+```json
+{"cmd":"emit_reports","count":3,"size":16}
+```
+
+#### `reject` / `force_exception` / `halt` / `unexpected_yield` / `seq`
+Request outcomes during an inspect. Inspect runs on a temporary copy of the machine, so none of them changes the application status:
+
+| Payload | Inspect response `status` |
+|---|---|
+| `{"cmd":"reject"}` | `Rejected` |
+| `{"cmd":"force_exception","hex":"0xdeadbeef0102"}` | `Exception`, `exception_data` = `0xdeadbeef0102` |
+| `{"cmd":"halt"}` | `MachineHalted` |
+| `{"cmd":"unexpected_yield"}` | `Failed` |
+| `{"cmd":"seq","steps":[{"cmd":"emit_reports","count":2},{"cmd":"reject"}]}` | `Rejected` with the 2 reports |
 
 ---
 
@@ -357,9 +480,7 @@ The test suite verifies:
 
 ### Large advance notices
 
-The advance-path notice test uses 1.25 MB as a stable large-payload case. Inspect reports still cover a ~1.85 MB payload in `04-reports`; historically, larger advance notices could intermittently finish as `EXCEPTION`.
-
-Tracked in [jplgarcia/tester#2](https://github.com/jplgarcia/tester/issues/2). Mitigations: fresh `cartesi run`, retry the suite, or align machine/node resources if you control them.
+With `rollup-http-server` (versions of this dapp before libcmt), a notice above ~2.6 MB made the 6 MB hex JSON body exceed the server's 5 MiB limit; the server answered `400` before reading the body, the dapp died of `SIGPIPE` and the input ended as `EXCEPTION` (terminal app), see [jplgarcia/tester#2](https://github.com/jplgarcia/tester/issues/2). The libcmt build has no such path: any size that does not fit the 2 MiB buffer is a clean `REJECTED`.
 
 ### `forge script` fails with "environment variable not found"
 
@@ -409,10 +530,15 @@ curl -s http://localhost:6751/anvil -X POST -H "Content-Type: application/json" 
 # If result is "0x0", wait a few more seconds and try again
 ```
 
-| Output | Max payload |
-|---|---|
-| Notice | 2,097,152 bytes (2 MB) |
-| Report | 2,097,152 bytes (2 MB) |
-| Voucher calldata | 2,097,152 bytes (2 MB) |
+### Output size limits
 
-Exceeding the limit causes the rollup server to reject the `/notice` or `/report` POST, which this dapp propagates as a rejected advance input for notices, and as a silently truncated run (no more reports) for inspect.
+| Output | Encoded as | Max payload |
+|---|---|---|
+| Notice | `Notice(bytes)`: 4 + 32 + 32 + payload padded to 32 | 2,097,056 bytes |
+| Voucher calldata | `Voucher(address,uint256,bytes)`: 4 + 4*32 + payload padded to 32 | 2,096,992 bytes |
+| Report | raw bytes | 2,097,152 bytes |
+| Raw output (`emit_blob`) | raw bytes | 2,097,152 bytes |
+
+The limit is on the **encoded** output: the whole output must fit the 2,097,152-byte CMIO transmit buffer. A notice/voucher adds its ABI header and 32-byte padding, so the largest notice payload is **2,097,056** bytes (`68 + 32*ceil(n/32) <= 2097152`); a payload of exactly 2 MiB is rejected. Reports are written raw (no header), so a 2,097,152-byte report fits.
+
+Exceeding the limit makes libcmt return `-ENOBUFS` (`-105`), which this dapp propagates as a rejected advance input for notices/reports, and as a silently truncated run (no more reports) for inspect.
