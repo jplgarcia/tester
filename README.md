@@ -57,9 +57,39 @@ private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
 ---
 
+## Building the snapshot
+
+Node alpha.13 needs a snapshot built with **cartesi-machine 0.21.0**. `cartesi build` from CLI `2.0.0-alpha.35` pins emulator 0.20.0, so the snapshot is built by a script that reproduces the CLI pipeline with the pinned toolchain (everything in `scripts/build.env`, the `Dockerfile` and `scripts/dependencies.sha256`):
+
+```bash
+make snapshot          # or: scripts/build-snapshot.sh
+make snapshot-clean    # cold build (no BuildKit cache), what CI and the reproducibility check use
+```
+
+Requirements: Docker with buildx and riscv64 emulation (Docker Desktop has it; on Linux `docker run --privileged --rm tonistiigi/binfmt --install riscv64`), `curl`, `git`. `IMAGES_DIR=<dir>` reuses an existing download of the kernel and rootfs-tools (they are always sha256-checked).
+
+| Step | Tool (pinned) | Output |
+|---|---|---|
+| kernel `linux-6.5.13-ctsi-2-v0.21.0.bin`, `rootfs-tools.ext2` (v0.18.0) | sha256 = node tag `test/dependencies.sha256` | `.build/images/` |
+| riscv64 root filesystem | `docker buildx` on `ubuntu:noble-20250910@sha256:…`, apt only from `snapshot.ubuntu.com` @ `20250915T030400Z`, guest tools .deb and picojson by sha256, file times = `SOURCE_DATE_EPOCH` | `.build/root.tar` |
+| ext2 | `xgenext2fs --block-size 4096 --faketime --readjustment +0` (from `cartesi/sdk:0.12.0-alpha.41@sha256:…`, as `cartesi build`) | `.build/root.ext2` |
+| machine | `cartesi/machine-emulator:0.21.0@sha256:…`: `cartesi-machine --ram-length=128Mi --flash-drive=label:root,data_filename:root.ext2 --env=PATH=… --workdir=/opt/cartesi/dapp --final-hash --store=snapshot -- /opt/cartesi/dapp/dapp`, stopped at the dapp's first accepted yield | `.build/snapshot/` |
+| release files | template hash = `cartesi-machine-stored-hash` (checked equal to `hash_tree.sht`@0x60, what the CLI reads); deterministic `tar` + `gzip -n` | `.build/template-hash.txt`, `snapshot.tar.gz`, `snapshot.tar.gz.sha256`, `build-info.txt` |
+
+Template hash of this source: `0xbbb07f2e3f0339ae5c8fcff025553fc3043a2f4cb0ebaa4f268cc4c9ccf65f96` (two cold builds from fresh clones gave the same template hash and byte-identical `root.tar`, `root.ext2` and `snapshot.tar.gz`, sha256 `c95b16495f73a31c915b433a214f6cd6eb99caa5b7beea014cfcf3f805704306`). It was deployed on a rollups-node v2.0.0-alpha.13 devnet (Authority): deposits of every portal, ETH and ERC-20 voucher execution, notice validation and every QA command behaved as documented below.
+
+Deploy on a node alpha.13 (any network, since the alpha.10 addresses are the same everywhere):
+
+```bash
+mkdir tester && tar -xzf snapshot.tar.gz -C tester
+cartesi-rollups-cli deploy application tester ./tester    # see the node docs for consensus/epoch options
+```
+
 ## Running
 
 ### 1 — Build and start the devnet
+
+> `cartesi build` / `cartesi run` from CLI `2.0.0-alpha.35` use their own emulator (0.20.0) and node: fine for iterating on the dapp locally, but the template hash differs from the alpha.13 snapshot. To test against node alpha.13, deploy the snapshot from `make snapshot` (or the release) with `cartesi-rollups-cli deploy application`.
 
 `cartesi run` in v2 proxies all services through a single port (default `6751`):
 
@@ -371,7 +401,7 @@ The dapp process exits, so the machine halts while processing the input: input a
 #### `unexpected_yield` / `invalid_outputs_root` / `invalid_outputs_root_length`
 The other guest-caused terminal outcomes (throwaway apps only):
 - `unexpected_yield`: a manual yield with a reason the node does not know -> `UNEXPECTED_YIELD`.
-- `invalid_outputs_root`: the input is finished as accepted but declares 32 bytes of `0x5a` as outputs root. The input is `ACCEPTED`; the app becomes `INVALID_OUTPUTS_ROOT` when its epoch closes and the node finds the declared root differs from the one computed from the stored outputs.
+- `invalid_outputs_root`: the input is finished as accepted but declares 32 bytes of `0x5a` as outputs root. The input is `ACCEPTED`; when its epoch closes the node compares the root declared by the epoch's **last** input with the one computed from the stored outputs, so the app becomes `INVALID_OUTPUTS_ROOT` only if no later input of the same epoch was processed (the dapp keeps running and the next input declares the real root again). Use a short epoch, or send it last.
 - `invalid_outputs_root_length`: accepted yield declaring a 31-byte root -> the input fails and the app is `INVALID_OUTPUTS_ROOT` at once.
 ```json
 {"cmd":"unexpected_yield"}
