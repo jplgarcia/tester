@@ -23,20 +23,30 @@ make    # repo root — produces ./dapp
 
 ## Stack
 
-This repo is updated for Cartesi Rollups node `v2.0.0-alpha.12`, `rollups-contracts v3.0.0-alpha.6`, and `machine-guest-tools v0.17.2` (the machine tooling used by that node version).
+This repo targets Cartesi Rollups node `v2.0.0-alpha.13` with `rollups-contracts v3.0.0-alpha.10`:
 
-## Addresses (from `cartesi address-book`)
+| Component | Version | Pin |
+|---|---|---|
+| rollups-node | `v2.0.0-alpha.13` | commit `36155487d8bcb1daca5d683b8fa4ec65feba3ab7` |
+| rollups-contracts | `v3.0.0-alpha.10` | addresses below |
+| machine-guest-tools | `v0.18.0` | `machine-guest-tools_riscv64.deb` sha256 `204d4260defd68e11b957ae1f1b511b6c2c74345c918748be06f592733b72dcd` |
+| machine-emulator | `0.21.0` | the emulator used by node alpha.13; the snapshot must be built with it |
+| kernel | `linux-6.5.13-ctsi-2-v0.21.0.bin` | sha256 `5c900060da2db2bfa84cd39cd9cd722988c83c42225f3cac55f2d3157e48f32f` (node tag `test/dependencies.sha256`) |
 
-These are the local devnet addresses for the stack above:
+A snapshot built with another emulator version (for example the one pinned by `cartesi build` from CLI `2.0.0-alpha.35`, emulator 0.20.0) has a different template hash and is not loadable by node alpha.13.
+
+## Addresses
+
+rollups-contracts `v3.0.0-alpha.10` is deployed deterministically: the addresses are the same on the local devnet, Sepolia, Base Sepolia and OP Sepolia, so one snapshot serves every network. The portal addresses are compiled into `dapp.cpp` (deposits are recognised by `msg_sender`); a stack with other portal addresses needs a rebuild.
 
 | Contract | Address |
 |---|---|
-| InputBox | `0x346B3df038FE9f8380071eC6514D5a83aD143939` |
-| EtherPortal | `0x8b53327575ac999bdfa8003f4b5134DFF9027516` |
-| ERC20Portal | `0x22E57511C30CcE6CDaa742E13CE3b774fDC663b1` |
-| ERC721Portal | `0xcA3a0a47915C12F020CF70B938aCC8e744414cb8` |
-| ERC1155SinglePortal | `0x13663E193673756a02e84b724B8a3422A9a7aab4` |
-| ERC1155BatchPortal | `0x3649c5E2De91C69a7Bb80D864f0039da5E511096` |
+| InputBox | `0xEbE9f4Dfc04ae10bBeE663859c3dc5A23f94eA3C` |
+| EtherPortal | `0x035b11Be55656c6cfC822D1CaE568C1Af2e497b0` |
+| ERC20Portal | `0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419` |
+| ERC721Portal | `0x397c352d18DFf47CC8a6143403142cf7afd5Ff7E` |
+| ERC1155SinglePortal | `0x585F56351A66f131E176a345662215C772f80451` |
+| ERC1155BatchPortal | `0xee33550a22e3Cf6Cc265524dC9bcfD99D2307EBe` |
 
 Run `cartesi address-book` after `cartesi run` starts and copy any changed values into `tests/.env`. Test token contracts can be provided by the devnet or deployed via `forge script Deploy`; their addresses vary per run.
 
